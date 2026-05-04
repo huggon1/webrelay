@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>WebRelay</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>WebRelay</h1>
+        <p id="current-url"></p>
+      </header>
+
+      <label>
+        Intent
+        <textarea id="intent" rows="3" placeholder="Extract article title, author, date, and body"></textarea>
+      </label>
+
+      <section class="controls">
+        <button id="generate">Generate</button>
+        <button id="save" disabled>Save Profile</button>
+        <button id="repair" disabled>Repair</button>
+      </section>
+
+      <label>
+        Saved Profiles
+        <select id="profiles"></select>
+      </label>
+      <button id="run-profile">Run Profile</button>
+
+      <section class="status">
+        <strong>Status</strong>
+        <p id="status">Ready</p>
+      </section>
+
+      <section>
+        <strong>Result</strong>
+        <pre id="result"></pre>
+      </section>
+
+      <section>
+        <strong>Debug</strong>
+        <pre id="debug"></pre>
+      </section>
+    </main>
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>
