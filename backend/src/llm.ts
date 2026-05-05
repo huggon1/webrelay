@@ -36,6 +36,33 @@ export const recipeOutputSchema = {
   additionalProperties: false,
 } as const;
 
+export const transformOutputSchema = {
+  type: "object",
+  properties: {
+    version: { type: "number", const: 1 },
+    formatLabel: { type: "string", minLength: 1 },
+    outputDescription: { type: "string", minLength: 1 },
+    code: { type: "string", minLength: 1 },
+  },
+  required: ["version", "formatLabel", "outputDescription", "code"],
+  additionalProperties: false,
+} as const;
+
+export const artifactOutputSchema = {
+  type: "object",
+  properties: {
+    recipe: recipeOutputSchema,
+    transform: {
+      anyOf: [transformOutputSchema, { type: "null" }],
+    },
+    outputDescription: {
+      anyOf: [{ type: "string", minLength: 1 }, { type: "null" }],
+    },
+  },
+  required: ["recipe", "transform", "outputDescription"],
+  additionalProperties: false,
+} as const;
+
 export type CodexJsonOptions = {
   model?: string;
   modelReasoningEffort?: ModelReasoningEffort;
@@ -63,11 +90,23 @@ export function parseCodexFinalResponse(finalResponse: string) {
   return normalizeRecipeCandidate(parseJsonText(finalResponse));
 }
 
+export function parseCodexJsonResponse(finalResponse: string) {
+  return normalizeJsonCandidate(parseJsonText(finalResponse));
+}
+
 function normalizeRecipeCandidate(candidate: unknown) {
+  return normalizeJsonCandidate(candidate);
+}
+
+function normalizeJsonCandidate(candidate: unknown): unknown {
   if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return candidate;
-  const recipe = candidate as Record<string, unknown>;
-  const normalized: Record<string, unknown> = { ...recipe };
+  const normalized: Record<string, unknown> = { ...(candidate as Record<string, unknown>) };
   if (normalized.rootSelector === null) delete normalized.rootSelector;
+  if (normalized.transform === null) delete normalized.transform;
+  if (normalized.outputDescription === null) delete normalized.outputDescription;
+  if (normalized.recipe && typeof normalized.recipe === "object" && !Array.isArray(normalized.recipe)) {
+    normalized.recipe = normalizeJsonCandidate(normalized.recipe);
+  }
   if (Array.isArray(normalized.fields)) {
     normalized.fields = normalized.fields.map((field) => {
       if (!field || typeof field !== "object" || Array.isArray(field)) return field;
@@ -103,7 +142,10 @@ function buildThreadOptions(options: CodexJsonOptions = {}): ThreadOptions {
   };
 }
 
-function buildCodexPrompt(prompt: string) {
+function buildCodexPrompt(prompt: string, options: { allowTransformCode?: boolean } = {}) {
+  const codeRule = options.allowTransformCode
+    ? "- You may generate only the requested transform function body. Do not include imports, network calls, filesystem access, shell commands, timers, eval, Function constructors, or browser automation."
+    : "- Do not generate JavaScript or TypeScript code.";
   return `
 You are being used inside a local backend for a browser extension.
 
@@ -111,7 +153,7 @@ Hard constraints:
 - Do not modify files.
 - Do not run shell commands.
 - Do not use web search.
-- Do not generate JavaScript or TypeScript code.
+${codeRule}
 - Do not output markdown or explanations.
 - Your final response must be one JSON object that matches the provided output schema.
 
@@ -120,11 +162,19 @@ ${prompt}
 `;
 }
 
-export async function generateJsonFromLLM(prompt: string, options: CodexJsonOptions = {}) {
+export async function generateJsonWithSchema(
+  prompt: string,
+  outputSchema: object,
+  options: CodexJsonOptions & { allowTransformCode?: boolean } = {},
+) {
   const codex = new Codex();
   const thread = codex.startThread(buildThreadOptions(options));
-  const turn = await thread.run(buildCodexPrompt(prompt), {
-    outputSchema: recipeOutputSchema,
+  const turn = await thread.run(buildCodexPrompt(prompt, options), {
+    outputSchema,
   });
-  return parseCodexFinalResponse(turn.finalResponse);
+  return parseCodexJsonResponse(turn.finalResponse);
+}
+
+export async function generateJsonFromLLM(prompt: string, options: CodexJsonOptions = {}) {
+  return generateJsonWithSchema(prompt, recipeOutputSchema, options);
 }

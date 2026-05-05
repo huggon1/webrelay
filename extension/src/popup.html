@@ -19,16 +19,39 @@
       </label>
 
       <section class="controls">
-        <button id="generate">Generate</button>
-        <button id="save" disabled>Save Profile</button>
+        <button id="generate">Capture Preview</button>
+        <button id="save" disabled>Save Configuration</button>
         <button id="repair" disabled>Repair</button>
       </section>
 
       <label>
-        Saved Profiles
+        Refine or export
+        <textarea
+          id="refinement"
+          rows="3"
+          placeholder="Convert to markdown, rename fields, remove noise, or output a custom JSON shape"
+        ></textarea>
+      </label>
+
+      <section class="controls secondary-controls">
+        <button id="refine" disabled>Refine</button>
+        <button id="export" disabled>Export Format</button>
+      </section>
+
+      <label>
+        Saved Configurations
         <select id="profiles"></select>
       </label>
-      <button id="run-profile">Run Profile</button>
+
+      <label>
+        Default action
+        <select id="action-preset">
+          <option value="copy">Copy</option>
+          <option value="download">Download</option>
+          <option value="copy_download">Copy and download</option>
+        </select>
+      </label>
+      <button id="run-profile">Run Configuration</button>
 
       <section class="status">
         <strong>Status</strong>
@@ -36,14 +59,22 @@
       </section>
 
       <section>
-        <strong>Result</strong>
-        <pre id="result"></pre>
+        <div class="section-heading">
+          <strong>Output</strong>
+          <button id="copy-output" class="small-button" disabled>Copy Output</button>
+        </div>
+        <pre id="export-result"></pre>
       </section>
 
-      <section>
-        <strong>Debug</strong>
+      <details>
+        <summary>Debug</summary>
+        <div class="section-heading">
+          <strong>Structured extraction</strong>
+          <button id="copy-preview" class="small-button" disabled>Copy JSON</button>
+        </div>
+        <pre id="result"></pre>
         <pre id="debug"></pre>
-      </section>
+      </details>
     </main>
     <script type="module" src="popup.js"></script>
   </body>

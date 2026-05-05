@@ -45,6 +45,38 @@ export const extractionRecipeSchema = z
     }
   });
 
+export const transformSpecSchema = z
+  .object({
+    version: z.literal(1),
+    formatLabel: z.string().min(1),
+    outputDescription: z.string().min(1),
+    code: z.string().min(1),
+  })
+  .strict();
+
+export const exportResultSchema = z
+  .object({
+    formatLabel: z.string().min(1),
+    content: z.string(),
+    warnings: z.array(z.string()).default([]),
+  })
+  .strict();
+
+export const extractionArtifactSchema = z
+  .object({
+    recipe: extractionRecipeSchema,
+    transform: transformSpecSchema.optional(),
+    outputDescription: z.string().min(1).optional(),
+  })
+  .strict();
+
+export const actionPresetSchema = z
+  .object({
+    type: z.enum(["copy", "download", "copy_download"]),
+    downloadFilenameTemplate: z.string().min(1).optional(),
+  })
+  .strict();
+
 export const extractionProfileSchema = z
   .object({
     id: z.string().min(1),
@@ -52,9 +84,22 @@ export const extractionProfileSchema = z
     urlPattern: z.string().min(1),
     intent: z.string().min(1),
     recipe: extractionRecipeSchema,
+    transform: transformSpecSchema.optional(),
+    outputDescription: z.string().min(1).optional(),
+    actionPreset: actionPresetSchema.default({ type: "copy" }),
     createdAt: z.string().datetime(),
     updatedAt: z.string().datetime(),
     version: z.number().int().positive(),
+  })
+  .strict();
+
+export const lastUsedStateSchema = z
+  .object({
+    siteId: z.string().min(1),
+    configurationId: z.string().min(1),
+    urlPattern: z.string().min(1),
+    lastRunAt: z.string().datetime(),
+    lastActionPreset: actionPresetSchema,
   })
   .strict();
 
@@ -96,7 +141,12 @@ export const extractionResultSchema = z
 export type ValueSource = z.infer<typeof valueSourceSchema>;
 export type FieldRule = z.infer<typeof fieldRuleSchema>;
 export type ExtractionRecipe = z.infer<typeof extractionRecipeSchema>;
+export type TransformSpec = z.infer<typeof transformSpecSchema>;
+export type ExportResult = z.infer<typeof exportResultSchema>;
+export type ExtractionArtifact = z.infer<typeof extractionArtifactSchema>;
+export type ActionPreset = z.infer<typeof actionPresetSchema>;
 export type ExtractionProfile = z.infer<typeof extractionProfileSchema>;
+export type LastUsedState = z.infer<typeof lastUsedStateSchema>;
 export type ExecutionError = z.infer<typeof executionErrorSchema>;
 export type FieldDebug = z.infer<typeof fieldDebugSchema>;
 export type ExecutionDebug = z.infer<typeof executionDebugSchema>;
