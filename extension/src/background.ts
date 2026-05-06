@@ -1,5 +1,6 @@
 import {
   actionPresetSchema,
+  createUrlPattern,
   extractionArtifactSchema,
   extractionProfileSchema,
   extractionRecipeSchema,
@@ -15,12 +16,18 @@ import type {
   ActionRunResult,
   BackgroundRequest,
   BackgroundResponse,
+  ContentRequest,
   ContentResponse,
+  IntentAnalysis,
+  ToastVariant,
 } from "./messages.js";
 
 const BACKEND_URL = "http://localhost:8787";
 const PROFILES_KEY = "profiles";
 const LAST_USED_BY_SITE_KEY = "lastUsedBySite";
+const OFFSCREEN_COPY_MESSAGE = "OFFSCREEN_COPY";
+
+// ── Tab utilities ──────────────────────────────────────────────────────────
 
 async function getActiveTab() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -28,27 +35,10 @@ async function getActiveTab() {
   return { id: tab.id, url: tab.url, title: tab.title || tab.url };
 }
 
-async function sendToContent(
-  message: Extract<BackgroundRequest, { type: "CREATE_SNAPSHOT" | "RUN_RECIPE" }>,
-): Promise<ContentResponse> {
-  const tab = await getActiveTab();
-  ensureInjectableTab(tab.url);
-  try {
-    return await chrome.tabs.sendMessage(tab.id, message);
-  } catch (error) {
-    if (!isMissingContentScriptError(error)) throw error;
-    await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      files: ["content.js"],
-    });
-    return chrome.tabs.sendMessage(tab.id, message);
-  }
-}
-
 function ensureInjectableTab(urlValue: string) {
   const url = new URL(urlValue);
   if (url.protocol !== "http:" && url.protocol !== "https:") {
-    throw new Error("WebRelay can only inspect regular http and https pages. Open a normal web page and try again.");
+    throw new Error("WebRelay can only inspect regular http and https pages.");
   }
   if (url.hostname === "chromewebstore.google.com") {
     throw new Error("Chrome does not allow extensions to inspect the Chrome Web Store.");
@@ -60,75 +50,175 @@ function isMissingContentScriptError(error: unknown) {
   return message.includes("Could not establish connection") || message.includes("Receiving end does not exist");
 }
 
+async function sendToContent(tabId: number, message: ContentRequest): Promise<ContentResponse> {
+  try {
+    return await chrome.tabs.sendMessage(tabId, message);
+  } catch (error) {
+    if (!isMissingContentScriptError(error)) throw error;
+    await chrome.scripting.executeScript({ target: { tabId }, files: ["content.js"] });
+    return chrome.tabs.sendMessage(tabId, message);
+  }
+}
+
+async function sendToContentByActiveTab(
+  message: Extract<ContentRequest, { type: "CREATE_SNAPSHOT" | "RUN_RECIPE" }>,
+): Promise<ContentResponse> {
+  const tab = await getActiveTab();
+  ensureInjectableTab(tab.url);
+  return sendToContent(tab.id, message);
+}
+
+// ── Toast ──────────────────────────────────────────────────────────────────
+
+async function showToast(tabId: number, tabUrl: string, message: string, variant: ToastVariant) {
+  try {
+    ensureInjectableTab(tabUrl);
+    await sendToContent(tabId, { type: "SHOW_TOAST", message, variant });
+  } catch {
+    // Toast is best-effort; ignore errors
+  }
+}
+
+// ── Storage helpers ────────────────────────────────────────────────────────
+
 async function getProfiles(): Promise<ExtractionProfile[]> {
   const data = await chrome.storage.local.get(PROFILES_KEY);
-  const profiles = Array.isArray(data[PROFILES_KEY]) ? data[PROFILES_KEY] : [];
-  const parsedProfiles = profiles
-    .map((profile) => extractionProfileSchema.safeParse(profile))
-    .filter((result) => result.success)
-    .map((result) => result.data);
-  if (JSON.stringify(parsedProfiles) !== JSON.stringify(profiles)) {
-    await chrome.storage.local.set({ [PROFILES_KEY]: parsedProfiles });
+  const raw = Array.isArray(data[PROFILES_KEY]) ? data[PROFILES_KEY] : [];
+  const profiles = raw
+    .map((p) => extractionProfileSchema.safeParse(p))
+    .filter((r) => r.success)
+    .map((r) => r.data);
+  if (JSON.stringify(profiles) !== JSON.stringify(raw)) {
+    await chrome.storage.local.set({ [PROFILES_KEY]: profiles });
   }
-  return parsedProfiles;
+  return profiles;
 }
 
 async function saveProfile(profile: ExtractionProfile) {
   const parsed = extractionProfileSchema.parse(profile);
   const existing = await getProfiles();
-  const next = [parsed, ...existing.filter((item) => item.id !== parsed.id)];
-  await chrome.storage.local.set({ [PROFILES_KEY]: next });
+  await chrome.storage.local.set({
+    [PROFILES_KEY]: [parsed, ...existing.filter((p) => p.id !== parsed.id)],
+  });
   return parsed;
 }
 
-async function postBackend(path: string, body: unknown) {
-  const response = await fetch(`${BACKEND_URL}${path}`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  const payload = await response.json();
-  if (!response.ok) {
-    throw new Error(payload.error || `Backend request failed: ${response.status}`);
-  }
-  return payload;
+async function updateProfile(profileId: string, updates: Partial<ExtractionProfile>) {
+  const profiles = await getProfiles();
+  const idx = profiles.findIndex((p) => p.id === profileId);
+  if (idx === -1) throw new Error("Profile not found.");
+  const merged = extractionProfileSchema.parse({ ...profiles[idx], ...updates, id: profileId });
+  profiles[idx] = merged;
+  await chrome.storage.local.set({ [PROFILES_KEY]: profiles });
+  return merged;
 }
 
-function siteIdFromUrl(urlValue: string) {
-  return new URL(urlValue).origin;
+async function deleteProfile(profileId: string) {
+  const profiles = await getProfiles();
+  await chrome.storage.local.set({
+    [PROFILES_KEY]: profiles.filter((p) => p.id !== profileId),
+  });
 }
+
+async function updateLastUsed(profile: ExtractionProfile, actionPreset: ActionPreset, urlValue: string) {
+  const url = new URL(urlValue);
+  const data = await chrome.storage.local.get(LAST_USED_BY_SITE_KEY);
+  const existing =
+    data[LAST_USED_BY_SITE_KEY] && typeof data[LAST_USED_BY_SITE_KEY] === "object" && !Array.isArray(data[LAST_USED_BY_SITE_KEY])
+      ? data[LAST_USED_BY_SITE_KEY]
+      : {};
+  const state = lastUsedStateSchema.parse({
+    siteId: url.hostname,
+    configurationId: profile.id,
+    urlPattern: createUrlPattern(urlValue),
+    lastRunAt: new Date().toISOString(),
+    lastActionPreset: actionPreset,
+  });
+  await chrome.storage.local.set({
+    [LAST_USED_BY_SITE_KEY]: { ...existing, [state.siteId]: state },
+  });
+}
+
+async function getLastUsedProfileForSite(urlValue: string): Promise<ExtractionProfile | null> {
+  const url = new URL(urlValue);
+  const data = await chrome.storage.local.get(LAST_USED_BY_SITE_KEY);
+  const map = data[LAST_USED_BY_SITE_KEY] ?? {};
+  const state = map[url.hostname] ?? map[url.origin];
+  if (!state?.configurationId) return null;
+  const profiles = await getProfiles();
+  return profiles.find((p) => p.id === state.configurationId && matchesUrlPattern(p.urlPattern, urlValue)) ?? null;
+}
+
+// ── Transform execution (runs in page context to allow new Function) ───────
+
+async function runTransformInPage(tabId: number, transform: import("@extractor/shared").TransformSpec, data: unknown): Promise<ExportResult> {
+  try {
+    const [{ result: output }] = await chrome.scripting.executeScript({
+      target: { tabId },
+      args: [transform.code, data],
+      func: (code: string, input: unknown): string => {
+        // eslint-disable-next-line no-new-func
+        const fn = new Function("input", code) as (input: unknown) => string;
+        return fn(input);
+      },
+    });
+    if (typeof output !== "string") throw new Error("Transform did not return a string.");
+    return { formatLabel: transform.formatLabel, content: output, warnings: [] };
+  } catch (error) {
+    const raw = fallbackExportResult(data);
+    raw.warnings.push(`Transform failed: ${error instanceof Error ? error.message : String(error)}`);
+    return raw;
+  }
+}
+
+// ── Action execution ───────────────────────────────────────────────────────
 
 function fallbackExportResult(data: unknown): ExportResult {
-  return safePreviewExport(data);
+  return { formatLabel: "JSON", content: JSON.stringify(data, null, 2), warnings: [] };
 }
 
 function extensionForFormat(formatLabel: string) {
-  const normalized = formatLabel.toLowerCase();
-  if (normalized.includes("markdown")) return "md";
-  if (normalized.includes("csv")) return "csv";
-  if (normalized.includes("json")) return "json";
+  const lc = formatLabel.toLowerCase();
+  if (lc.includes("markdown")) return "md";
+  if (lc.includes("csv")) return "csv";
+  if (lc.includes("json")) return "json";
   return "txt";
 }
 
 function sanitizeFilenamePart(value: string) {
-  return value.replace(/[<>:"/\\|?*\u0000-\u001f]+/g, "-").replace(/\s+/g, " ").trim();
+  return value.replace(/[<>:"/\\|?*\x00-\x1f]+/g, "-").replace(/\s+/g, " ").trim();
 }
 
 function createDownloadFilename(profile: ExtractionProfile | undefined, exportResult: ExportResult) {
-  const baseName = sanitizeFilenamePart(profile?.name || "webrelay-export") || "webrelay-export";
+  const baseName = sanitizeFilenamePart(profile?.name ?? "webrelay-export") || "webrelay-export";
   const date = new Date().toISOString().slice(0, 10);
   return `${baseName}-${date}.${extensionForFormat(exportResult.formatLabel)}`;
 }
 
-async function copyExportContent(content: string) {
-  const tab = await getActiveTab();
-  await chrome.scripting.executeScript({
-    target: { tabId: tab.id },
-    args: [content],
-    func: async (value: string) => {
-      await navigator.clipboard.writeText(value);
-    },
+async function ensureOffscreenDocument() {
+  const documentUrl = chrome.runtime.getURL("offscreen.html");
+  const contexts = await chrome.runtime.getContexts({
+    contextTypes: [chrome.runtime.ContextType.OFFSCREEN_DOCUMENT],
+    documentUrls: [documentUrl],
   });
+  if (contexts.length > 0) return;
+
+  await chrome.offscreen.createDocument({
+    url: "offscreen.html",
+    reasons: [chrome.offscreen.Reason.CLIPBOARD],
+    justification: "Write WebRelay extraction results to the clipboard.",
+  });
+}
+
+async function copyExportContent(content: string) {
+  await ensureOffscreenDocument();
+  const response = await chrome.runtime.sendMessage({
+    type: OFFSCREEN_COPY_MESSAGE,
+    content,
+  }) as { ok: true } | { ok: false; error: string } | undefined;
+  if (!response?.ok) {
+    throw new Error(response?.error || "Clipboard write failed.");
+  }
 }
 
 async function downloadExportContent(exportResult: ExportResult, profile?: ExtractionProfile) {
@@ -140,11 +230,7 @@ async function downloadExportContent(exportResult: ExportResult, profile?: Extra
   });
 }
 
-async function applyAction(
-  exportResult: ExportResult,
-  actionPreset: ActionPreset,
-  profile?: ExtractionProfile,
-): Promise<ActionRunResult> {
+async function applyAction(exportResult: ExportResult, actionPreset: ActionPreset, profile?: ExtractionProfile): Promise<ActionRunResult> {
   const parsed = actionPresetSchema.parse(actionPreset);
   const result: ActionRunResult = { copied: false, downloaded: false, errors: [] };
 
@@ -169,70 +255,61 @@ async function applyAction(
   return result;
 }
 
-async function updateLastUsed(profile: ExtractionProfile, actionPreset: ActionPreset, urlValue: string) {
-  const data = await chrome.storage.local.get(LAST_USED_BY_SITE_KEY);
-  const existing =
-    data[LAST_USED_BY_SITE_KEY] &&
-    typeof data[LAST_USED_BY_SITE_KEY] === "object" &&
-    !Array.isArray(data[LAST_USED_BY_SITE_KEY])
-      ? data[LAST_USED_BY_SITE_KEY]
-      : {};
-  const state = lastUsedStateSchema.parse({
-    siteId: siteIdFromUrl(urlValue),
-    configurationId: profile.id,
-    urlPattern: profile.urlPattern,
-    lastRunAt: new Date().toISOString(),
-    lastActionPreset: actionPreset,
-  });
-  await chrome.storage.local.set({
-    [LAST_USED_BY_SITE_KEY]: {
-      ...existing,
-      [state.siteId]: state,
-    },
-  });
-}
+// ── Profile runner ─────────────────────────────────────────────────────────
 
-async function runProfile(profileId: string, actionOverride?: ActionPreset, shouldApplyAction = true) {
+async function runProfile(profileId: string, actionPresetOverride?: ActionPreset) {
   const tab = await getActiveTab();
   const profile = (await getProfiles()).find(
-    (candidate) => candidate.id === profileId && matchesUrlPattern(candidate.urlPattern, tab.url),
+    (p) => p.id === profileId && matchesUrlPattern(p.urlPattern, tab.url),
   );
   if (!profile) throw new Error("No matching saved configuration was found.");
 
-  const response = await sendToContent({ type: "RUN_RECIPE", recipe: profile.recipe });
-  if (!response.ok) throw new Error(response.error);
-  if (!("result" in response)) throw new Error("Profile run response was incomplete.");
-  const result = response.result;
-  let exportResult: ExportResult | undefined;
-  if (profile.transform) {
-    try {
-      const payload = await postBackend("/run-transform", {
-        transform: profile.transform,
-        data: result.data,
-      });
-      exportResult = exportResultSchema.parse(payload.exportResult);
-    } catch (error) {
-      exportResult = {
-        ...fallbackExportResult(result.data),
-        warnings: [`Saved output transform failed: ${error instanceof Error ? error.message : String(error)}`],
-      };
-    }
-  } else {
-    exportResult = fallbackExportResult(result.data);
-  }
+  const contentResponse = await sendToContentByActiveTab({ type: "RUN_RECIPE", recipe: profile.recipe });
+  if (!contentResponse.ok) throw new Error(contentResponse.error);
+  if (!("result" in contentResponse)) throw new Error("Profile run response was incomplete.");
 
-  const actionPreset = actionOverride ? actionPresetSchema.parse(actionOverride) : profile.actionPreset;
-  const actionResult = shouldApplyAction
-    ? await applyAction(exportResult, actionPreset, profile)
-    : { copied: false, downloaded: false, errors: [] };
-  if (result.ok && (!shouldApplyAction || actionResult.errors.length === 0)) {
+  const result = contentResponse.result;
+  const exportResult: ExportResult = profile.transform
+    ? await runTransformInPage(tab.id, profile.transform, result.data)
+    : fallbackExportResult(result.data);
+
+  const actionPreset = actionPresetOverride ? actionPresetSchema.parse(actionPresetOverride) : profile.actionPreset;
+  const actionResult = await applyAction(exportResult, actionPreset, profile);
+
+  const now = new Date().toISOString();
+  const hostnameUrlPattern = createUrlPattern(tab.url);
+  if (!result.ok || (result.ok && result.debug.rootMatchCount === 0 && result.debug.mode === "list")) {
+    // Auto-mark as possibly failed
+    await updateProfile(profileId, { status: "possibly_failed", urlPattern: hostnameUrlPattern, lastRunAt: now, updatedAt: now });
+  } else {
+    await updateProfile(profileId, { status: "ok", urlPattern: hostnameUrlPattern, actionPreset, lastRunAt: now, updatedAt: now });
     await updateLastUsed(profile, actionPreset, tab.url);
   }
+
   return { result, exportResult, actionResult };
 }
 
+// ── Backend proxy ──────────────────────────────────────────────────────────
+
+async function postBackend(path: string, body: unknown) {
+  const response = await fetch(`${BACKEND_URL}${path}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const payload = await response.json();
+  if (!response.ok) {
+    throw new Error(payload.error || `Backend request failed: ${response.status}`);
+  }
+  return payload;
+}
+
+// ── Message handler ────────────────────────────────────────────────────────
+
 chrome.runtime.onMessage.addListener(
   (message: BackgroundRequest, _sender, sendResponse: (response: BackgroundResponse) => void) => {
+    if ((message as { type?: string }).type === OFFSCREEN_COPY_MESSAGE) return false;
+
     void (async () => {
       try {
         if (message.type === "GET_ACTIVE_TAB") {
@@ -240,16 +317,37 @@ chrome.runtime.onMessage.addListener(
           return;
         }
 
-        if (message.type === "CREATE_SNAPSHOT" || message.type === "RUN_RECIPE") {
-          const response = await sendToContent(message);
+        if (message.type === "CREATE_SNAPSHOT") {
+          const response = await sendToContentByActiveTab({ type: "CREATE_SNAPSHOT" });
           if (!response.ok) throw new Error(response.error);
-          sendResponse(response);
+          if (!("snapshot" in response)) throw new Error("Snapshot response incomplete.");
+          sendResponse({ ok: true, snapshot: response.snapshot, url: response.url });
+          return;
+        }
+
+        if (message.type === "LIST_PROFILES_FOR_SITE") {
+          const profiles = (await getProfiles()).filter((p) => matchesUrlPattern(p.urlPattern, message.url));
+          sendResponse({ ok: true, profiles });
+          return;
+        }
+
+        if (message.type === "LIST_ALL_PROFILES") {
+          sendResponse({ ok: true, profiles: await getProfiles() });
           return;
         }
 
         if (message.type === "RUN_PROFILE") {
-          const response = await runProfile(message.profileId, message.actionPreset, message.applyAction);
+          const response = await runProfile(message.profileId, message.actionPresetOverride);
           sendResponse({ ok: true, ...response });
+          return;
+        }
+
+        if (message.type === "ANALYZE_INTENT") {
+          const payload = await postBackend("/analyze-intent", {
+            domSnapshot: message.domSnapshot,
+            url: message.url,
+          });
+          sendResponse({ ok: true, analysis: payload.analysis as IntentAnalysis });
           return;
         }
 
@@ -258,12 +356,42 @@ chrome.runtime.onMessage.addListener(
             url: message.url,
             intent: message.intent,
             domSnapshot: message.domSnapshot,
+            confirmedFields: message.confirmedFields,
           });
-          sendResponse({ ok: true, recipe: extractionRecipeSchema.parse(payload.recipe) });
+          const recipe = extractionRecipeSchema.parse(payload.recipe);
+          // Run the recipe immediately for preview
+          const contentResponse = await sendToContentByActiveTab({ type: "RUN_RECIPE", recipe });
+          if (!contentResponse.ok) throw new Error(contentResponse.error);
+          if (!("result" in contentResponse)) throw new Error("Recipe run response incomplete.");
+          sendResponse({ ok: true, recipe, result: contentResponse.result });
           return;
         }
 
-        if (message.type === "TRANSFORM_RESULT") {
+        if (message.type === "REFINE_RECIPE") {
+          const payload = await postBackend("/refine", {
+            url: message.url,
+            intent: message.intent,
+            feedback: message.feedback,
+            domSnapshot: message.domSnapshot,
+            currentRecipe: message.currentRecipe,
+            currentResult: message.currentResult,
+          });
+          const artifact = extractionArtifactSchema.parse(payload.artifact);
+          const recipe = artifact.recipe;
+          const transform = artifact.transform ?? null;
+          const tab = await getActiveTab();
+          const contentResponse = await sendToContent(tab.id, { type: "RUN_RECIPE", recipe });
+          if (!contentResponse.ok) throw new Error(contentResponse.error);
+          if (!("result" in contentResponse)) throw new Error("Recipe run response incomplete.");
+          const result = contentResponse.result;
+          const exportResult = transform
+            ? await runTransformInPage(tab.id, transform, result.data)
+            : fallbackExportResult(result.data);
+          sendResponse({ ok: true, recipe, result, transform, exportResult });
+          return;
+        }
+
+        if (message.type === "GENERATE_TRANSFORM") {
           const payload = await postBackend("/transform", {
             intent: message.intent,
             outputRequest: message.outputRequest,
@@ -277,75 +405,38 @@ chrome.runtime.onMessage.addListener(
           return;
         }
 
-        if (message.type === "RUN_TRANSFORM") {
-          const payload = await postBackend("/run-transform", {
-            transform: message.transform,
-            data: message.data,
-          });
-          sendResponse({ ok: true, exportResult: exportResultSchema.parse(payload.exportResult) });
-          return;
-        }
-
-        if (message.type === "MARK_PROFILE_USED") {
-          const tab = await getActiveTab();
-          await updateLastUsed(message.profile, actionPresetSchema.parse(message.actionPreset), tab.url);
-          sendResponse({ ok: true, actionResult: { copied: false, downloaded: false, errors: [] } });
-          return;
-        }
-
-        if (message.type === "APPLY_ACTION") {
-          const exportResult = exportResultSchema.parse(message.exportResult);
-          const actionPreset = actionPresetSchema.parse(message.actionPreset);
-          const actionResult = await applyAction(exportResult, actionPreset, message.profile);
-          if (message.profile && actionResult.errors.length === 0) {
-            const tab = await getActiveTab();
-            await updateLastUsed(message.profile, actionPreset, tab.url);
-          }
-          sendResponse({ ok: true, actionResult });
-          return;
-        }
-
-        if (message.type === "REFINE_ARTIFACT") {
-          const payload = await postBackend("/refine", {
-            url: message.url,
-            intent: message.intent,
-            feedback: message.feedback,
-            domSnapshot: message.domSnapshot,
-            currentRecipe: message.currentRecipe,
-            currentResult: message.currentResult,
-          });
-          sendResponse({
-            ok: true,
-            artifact: extractionArtifactSchema.parse(payload.artifact),
-            exportResult: payload.exportResult ? exportResultSchema.parse(payload.exportResult) : undefined,
-          });
-          return;
-        }
-
         if (message.type === "REPAIR_RECIPE") {
+          const profiles = await getProfiles();
+          const profile = profiles.find((p) => p.id === message.profileId);
+          if (!profile) throw new Error("Profile not found.");
           const payload = await postBackend("/repair-recipe", {
             url: message.url,
-            intent: message.intent,
+            intent: profile.intent,
             domSnapshot: message.domSnapshot,
-            oldRecipe: message.oldRecipe,
-            debug: message.debug,
-            failureReason: message.failureReason,
+            oldRecipe: profile.recipe,
+            userNote: message.userNote,
           });
-          sendResponse({ ok: true, recipe: extractionRecipeSchema.parse(payload.recipe) });
-          return;
-        }
-
-        if (message.type === "LIST_PROFILES") {
-          const tab = await getActiveTab();
-          const profiles = (await getProfiles()).filter((profile) =>
-            matchesUrlPattern(profile.urlPattern, tab.url),
-          );
-          sendResponse({ ok: true, profiles });
+          const recipe = extractionRecipeSchema.parse(payload.recipe);
+          const contentResponse = await sendToContentByActiveTab({ type: "RUN_RECIPE", recipe });
+          if (!contentResponse.ok) throw new Error(contentResponse.error);
+          if (!("result" in contentResponse)) throw new Error("Recipe run response incomplete.");
+          sendResponse({ ok: true, recipe, result: contentResponse.result });
           return;
         }
 
         if (message.type === "SAVE_PROFILE") {
           sendResponse({ ok: true, profile: await saveProfile(message.profile) });
+          return;
+        }
+
+        if (message.type === "UPDATE_PROFILE") {
+          sendResponse({ ok: true, profile: await updateProfile(message.profileId, message.updates) });
+          return;
+        }
+
+        if (message.type === "DELETE_PROFILE") {
+          await deleteProfile(message.profileId);
+          sendResponse({ ok: true, profiles: await getProfiles() });
           return;
         }
 
@@ -357,3 +448,41 @@ chrome.runtime.onMessage.addListener(
     return true;
   },
 );
+
+// ── Keyboard shortcut handler ──────────────────────────────────────────────
+
+chrome.commands.onCommand.addListener((command) => {
+  if (command !== "run-last-profile") return;
+
+  void (async () => {
+    const tab = await getActiveTab().catch(() => null);
+    if (!tab) return;
+
+    try {
+      ensureInjectableTab(tab.url);
+    } catch {
+      return;
+    }
+
+    const profile = await getLastUsedProfileForSite(tab.url);
+    if (!profile) {
+      await showToast(tab.id, tab.url, "No saved configuration for this site. Open WebRelay to create one.", "info");
+      return;
+    }
+
+    try {
+      const { actionResult } = await runProfile(profile.id);
+      const errors = actionResult.errors;
+      if (errors.length > 0) {
+        await showToast(tab.id, tab.url, `Run failed: ${errors[0]}`, "error");
+      } else {
+        const parts: string[] = [];
+        if (actionResult.copied) parts.push("Copied to clipboard");
+        if (actionResult.downloaded) parts.push("Downloaded");
+        await showToast(tab.id, tab.url, parts.join(" / ") || "Done", "success");
+      }
+    } catch (error) {
+      await showToast(tab.id, tab.url, `Run failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+    }
+  })();
+});

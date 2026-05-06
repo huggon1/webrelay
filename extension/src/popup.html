@@ -13,68 +13,93 @@
         <p id="current-url"></p>
       </header>
 
-      <label>
-        Intent
-        <textarea id="intent" rows="3" placeholder="Extract article title, author, date, and body"></textarea>
-      </label>
+      <nav class="tabs">
+        <button id="tab-codex" class="tab-btn">Codex Studio</button>
+        <button id="tab-quickrun" class="tab-btn active">Quick Run</button>
+      </nav>
 
-      <section class="controls">
-        <button id="generate">Capture Preview</button>
-        <button id="save" disabled>Save Configuration</button>
-        <button id="repair" disabled>Repair</button>
-      </section>
+      <!-- Quick Run Panel -->
+      <div id="panel-quickrun" class="tab-panel">
+        <div id="profile-list"></div>
+        <button id="btn-new-config" class="btn-secondary btn-full">+ New config (Codex required)</button>
+      </div>
 
-      <label>
-        Refine or export
-        <textarea
-          id="refinement"
-          rows="3"
-          placeholder="Convert to markdown, rename fields, remove noise, or output a custom JSON shape"
-        ></textarea>
-      </label>
-
-      <section class="controls secondary-controls">
-        <button id="refine" disabled>Refine</button>
-        <button id="export" disabled>Export Format</button>
-      </section>
-
-      <label>
-        Saved Configurations
-        <select id="profiles"></select>
-      </label>
-
-      <label>
-        Default action
-        <select id="action-preset">
-          <option value="copy">Copy</option>
-          <option value="download">Download</option>
-          <option value="copy_download">Copy and download</option>
-        </select>
-      </label>
-      <button id="run-profile">Run Configuration</button>
-
-      <section class="status">
-        <strong>Status</strong>
-        <p id="status">Ready</p>
-      </section>
-
-      <section>
-        <div class="section-heading">
-          <strong>Output</strong>
-          <button id="copy-output" class="small-button" disabled>Copy Output</button>
+      <!-- Codex Studio Panel -->
+      <div id="panel-codex" class="tab-panel hidden">
+        <div class="cs-header">
+          <div id="step-indicator" class="step-indicator hidden">
+            <span class="step-dot" data-step="1"><span class="step-label">Extract</span></span>
+            <span class="step-line"></span>
+            <span class="step-dot" data-step="2"><span class="step-label">Review</span></span>
+            <span class="step-line"></span>
+            <span class="step-dot" data-step="3"><span class="step-label">Save</span></span>
+          </div>
+          <button id="btn-start-over" class="btn-ghost btn-start-over hidden">Start over</button>
         </div>
-        <pre id="export-result"></pre>
-      </section>
 
-      <details>
-        <summary>Debug</summary>
-        <div class="section-heading">
-          <strong>Structured extraction</strong>
-          <button id="copy-preview" class="small-button" disabled>Copy JSON</button>
+        <!-- Screen: Entry -->
+        <div id="cs-entry" class="cs-screen">
+          <p class="cs-hint">Describe what to extract, or leave blank to auto-detect.</p>
+          <label class="field-label">
+            Intent (optional)
+            <textarea id="cs-intent" rows="3" placeholder="e.g. Extract product name, price, and description"></textarea>
+          </label>
+          <button id="btn-extract" class="btn-primary btn-full">Extract &amp; Format</button>
         </div>
-        <pre id="result"></pre>
-        <pre id="debug"></pre>
-      </details>
+
+        <!-- Screen: Extracting (loading) -->
+        <div id="cs-extracting" class="cs-screen hidden">
+          <p class="cs-loading">Analyzing, extracting, and formatting...</p>
+        </div>
+
+        <!-- Screen: Result (formatted output + feedback) -->
+        <div id="cs-result" class="cs-screen hidden">
+          <div class="result-header">
+            <span id="cs-format-label" class="format-badge">JSON</span>
+          </div>
+          <pre id="cs-result-content" class="result-box"></pre>
+          <label class="field-label">
+            Feedback (optional)
+            <textarea
+              id="cs-result-feedback"
+              rows="2"
+              placeholder="e.g. Use a table, show only top 5, remove currency symbols..."
+            ></textarea>
+          </label>
+          <div class="row-btns">
+            <button id="btn-refine" class="btn-secondary">Refine</button>
+            <button id="btn-result-next" class="btn-primary">Save config</button>
+          </div>
+        </div>
+
+        <!-- Screen: Save -->
+        <div id="cs-save" class="cs-screen hidden">
+          <label class="field-label">
+            Configuration name
+            <input type="text" id="cs-config-name" placeholder="e.g. Product listing extractor" />
+          </label>
+          <div class="row-btns">
+            <button id="btn-save-back" class="btn-ghost">Back</button>
+            <button id="btn-save-config" class="btn-primary">Save configuration</button>
+          </div>
+        </div>
+
+        <!-- Screen: Repair entry -->
+        <div id="cs-repair" class="cs-screen hidden">
+          <p class="cs-label">Repairing: <strong id="cs-repair-name"></strong></p>
+          <p id="cs-repair-reason" class="cs-hint"></p>
+          <label class="field-label">
+            Additional notes (optional)
+            <textarea id="cs-repair-note" rows="2" placeholder="e.g. The page layout changed last week"></textarea>
+          </label>
+          <div class="row-btns">
+            <button id="btn-repair-back" class="btn-ghost">Cancel</button>
+            <button id="btn-repair-start" class="btn-primary">Start repair</button>
+          </div>
+        </div>
+      </div>
+
+      <p id="status-bar" class="status-bar"></p>
     </main>
     <script type="module" src="popup.js"></script>
   </body>

@@ -142,22 +142,24 @@ describe("createDomSnapshot", () => {
 });
 
 describe("url profiles", () => {
-  it("creates and matches simple wildcard URL patterns", () => {
+  it("creates and matches hostname-wide URL patterns", () => {
     const pattern = createUrlPattern("https://example.com/products/123");
-    expect(pattern).toBe("https://example.com/products/*");
+    expect(pattern).toBe("*://example.com/*");
     expect(matchesUrlPattern(pattern, "https://example.com/products/456")).toBe(true);
-    expect(matchesUrlPattern(pattern, "https://example.com/articles/456")).toBe(false);
+    expect(matchesUrlPattern(pattern, "https://example.com/articles/456")).toBe(true);
+    expect(matchesUrlPattern(pattern, "http://example.com/other")).toBe(true);
+    expect(matchesUrlPattern(pattern, "https://other.example.com/products/456")).toBe(false);
   });
 
-  it("generalizes article slugs under the same section", () => {
-    const pattern = createUrlPattern("https://example.com/articles/my-useful-post");
-    expect(pattern).toBe("https://example.com/articles/*");
+  it("matches old path-based patterns by hostname for compatibility", () => {
+    const pattern = "https://example.com/articles/*";
     expect(matchesUrlPattern(pattern, "https://example.com/articles/another-post")).toBe(true);
+    expect(matchesUrlPattern(pattern, "https://example.com/products/456")).toBe(true);
     expect(matchesUrlPattern(pattern, "https://other.example.com/articles/another-post")).toBe(false);
   });
 
-  it("does not generalize static asset filenames", () => {
+  it("creates hostname-wide patterns for static asset filenames", () => {
     const pattern = createUrlPattern("https://example.com/assets/logo.png");
-    expect(pattern).toBe("https://example.com/assets/logo.png");
+    expect(pattern).toBe("*://example.com/*");
   });
 });

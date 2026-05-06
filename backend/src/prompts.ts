@@ -73,24 +73,35 @@ Forbidden in transform code: imports, require, process, globalThis, window, docu
 Never add keys outside this shape.
 `;
 
-export function buildGeneratePrompt(input: {
+export function buildAnalyzeIntentPrompt(input: {
   url: string;
-  intent: string;
   domSnapshot: string;
 }) {
   return `
-You generate a reusable browser content extraction recipe for the current page.
+Analyze this webpage and suggest the most useful fields a user could extract from it.
 
 URL:
 ${input.url}
 
-User extraction intent:
-${input.intent}
-
 Page DOM snapshot:
 ${input.domSnapshot}
 
-${recipeContract}
+Return only strict JSON. Do not use markdown.
+The JSON must match this TypeScript shape:
+{
+  "pageDescription": "One sentence describing the type and content of this page",
+  "suggestedMode": "single" | "list",
+  "suggestedFields": [
+    {
+      "name": "camelCase field name",
+      "description": "What this field contains",
+      "example": "Short example value or null"
+    }
+  ]
+}
+Use "list" mode if the page contains repeated items (products, articles, comments, search results).
+Use "single" mode for detail pages with one main entity.
+Suggest 3-8 of the most useful fields.
 `;
 }
 
@@ -99,26 +110,19 @@ export function buildRepairPrompt(input: {
   intent: string;
   domSnapshot: string;
   oldRecipe: ExtractionRecipe;
-  debug: ExecutionDebug;
-  failureReason: string;
+  userNote?: string;
 }) {
   return `
-Repair this extraction recipe for the current page. Keep the user's intent, but update selectors and fields so the recipe succeeds.
+Repair this extraction recipe for the current page. Keep the user's intent, but update selectors and fields so the recipe works with the current DOM.
 
 URL:
 ${input.url}
 
 User extraction intent:
 ${input.intent}
-
-Failure reason:
-${input.failureReason}
-
+${input.userNote ? `\nUser note:\n${input.userNote}` : ""}
 Old recipe:
 ${JSON.stringify(input.oldRecipe, null, 2)}
-
-Execution debug:
-${JSON.stringify(input.debug, null, 2)}
 
 Current page DOM snapshot:
 ${input.domSnapshot}
@@ -127,19 +131,53 @@ ${recipeContract}
 `;
 }
 
+export function buildGeneratePrompt(input: {
+  url: string;
+  intent: string;
+  domSnapshot: string;
+  confirmedFields?: string[];
+}) {
+  const fieldsSection = input.confirmedFields && input.confirmedFields.length > 0
+    ? `\nConfirmed fields to extract (use these exact names):\n${input.confirmedFields.map((f) => `- ${f}`).join("\n")}\n`
+    : "";
+  return `
+You generate a reusable browser content extraction recipe for the current page.
+
+URL:
+${input.url}
+
+User extraction intent:
+${input.intent}
+${fieldsSection}
+Page DOM snapshot:
+${input.domSnapshot}
+
+${recipeContract}
+`;
+}
+
+
 export function buildTransformPrompt(input: {
   intent: string;
   outputRequest: string;
   result: ExtractionResult;
 }) {
+  const requestSection = input.outputRequest === "auto"
+    ? `Analyze the extracted data and choose the most appropriate presentation format. Consider:
+- Markdown table: for lists of items with multiple fields (products, articles, search results)
+- Prose paragraphs: for single-item pages with descriptive content
+- CSV: when the data is clearly tabular and spreadsheet-friendly
+- Simple list: for flat collections of similar items
+Base your choice on the data structure and content type.`
+    : `User output request:\n${input.outputRequest}`;
+
   return `
 Generate a reusable local output transform for extracted webpage data.
 
 Original extraction intent:
 ${input.intent}
 
-User output request:
-${input.outputRequest}
+${requestSection}
 
 Extraction result data:
 ${JSON.stringify(input.result.data, null, 2)}

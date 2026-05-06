@@ -3,11 +3,20 @@
   "name": "WebRelay",
   "version": "0.1.0",
   "description": "Capture structured web content and relay it through reusable extraction profiles.",
-  "permissions": ["activeTab", "storage", "scripting", "downloads"],
+  "permissions": ["activeTab", "storage", "scripting", "downloads", "clipboardWrite", "offscreen"],
   "host_permissions": ["http://localhost:8787/*"],
   "action": {
     "default_popup": "popup.html",
     "default_title": "Extract content"
+  },
+  "commands": {
+    "run-last-profile": {
+      "suggested_key": {
+        "default": "Alt+Shift+E",
+        "mac": "Alt+Shift+E"
+      },
+      "description": "Run last used extraction profile for this site"
+    }
   },
   "background": {
     "service_worker": "background.js",

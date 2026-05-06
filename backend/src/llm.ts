@@ -63,6 +63,30 @@ export const artifactOutputSchema = {
   additionalProperties: false,
 } as const;
 
+export const intentAnalysisOutputSchema = {
+  type: "object",
+  properties: {
+    pageDescription: { type: "string", minLength: 1 },
+    suggestedMode: { type: "string", enum: ["single", "list"] },
+    suggestedFields: {
+      type: "array",
+      minItems: 1,
+      items: {
+        type: "object",
+        properties: {
+          name: { type: "string", minLength: 1 },
+          description: { type: "string", minLength: 1 },
+          example: { anyOf: [{ type: "string" }, { type: "null" }] },
+        },
+        required: ["name", "description", "example"],
+        additionalProperties: false,
+      },
+    },
+  },
+  required: ["pageDescription", "suggestedMode", "suggestedFields"],
+  additionalProperties: false,
+} as const;
+
 export type CodexJsonOptions = {
   model?: string;
   modelReasoningEffort?: ModelReasoningEffort;

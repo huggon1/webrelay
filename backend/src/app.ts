@@ -16,9 +16,10 @@ import {
   artifactOutputSchema,
   generateJsonFromLLM,
   generateJsonWithSchema,
+  intentAnalysisOutputSchema,
   transformOutputSchema,
 } from "./llm.js";
-import { buildGeneratePrompt, buildRefinePrompt, buildRepairPrompt, buildTransformPrompt } from "./prompts.js";
+import { buildAnalyzeIntentPrompt, buildGeneratePrompt, buildRefinePrompt, buildRepairPrompt, buildTransformPrompt } from "./prompts.js";
 import { detectRiskyRequest, runTransform, safePreviewExport, validateTransformSpec } from "./transform.js";
 
 const generateRequestSchema = z.object({
@@ -27,10 +28,17 @@ const generateRequestSchema = z.object({
   domSnapshot: z.string().min(1),
 });
 
-const repairRequestSchema = generateRequestSchema.extend({
+const analyzeIntentRequestSchema = z.object({
+  url: z.string().url(),
+  domSnapshot: z.string().min(1),
+});
+
+const repairRequestSchema = z.object({
+  url: z.string().url(),
+  intent: z.string().min(1),
+  domSnapshot: z.string().min(1),
   oldRecipe: extractionRecipeSchema,
-  debug: executionDebugSchema,
-  failureReason: z.string().min(1),
+  userNote: z.string().optional(),
 });
 
 const transformRequestSchema = z.object({
@@ -82,6 +90,27 @@ export function createApp() {
     res.json({ ok: true, provider: "codex" });
   });
 
+  app.post("/analyze-intent", async (req, res) => {
+    try {
+      const input = analyzeIntentRequestSchema.parse(req.body);
+      const candidate = await generateJsonWithSchema(buildAnalyzeIntentPrompt(input), intentAnalysisOutputSchema);
+      const raw = candidate as { pageDescription: string; suggestedMode: string; suggestedFields: { name: string; description: string; example: string | null }[] };
+      const analysis = {
+        pageDescription: raw.pageDescription,
+        suggestedMode: raw.suggestedMode as "single" | "list",
+        suggestedFields: raw.suggestedFields.map((f) => ({
+          name: f.name,
+          description: f.description,
+          example: f.example ?? undefined,
+        })),
+      };
+      res.json({ analysis });
+    } catch (error) {
+      const status = error instanceof z.ZodError ? 400 : 500;
+      res.status(status).json(serializeError(error));
+    }
+  });
+
   app.post("/generate-recipe", async (req, res) => {
     try {
       const input = generateRequestSchema.parse(req.body);
@@ -96,7 +125,7 @@ export function createApp() {
   app.post("/repair-recipe", async (req, res) => {
     try {
       const input = repairRequestSchema.parse(req.body);
-      const candidate = await generateJsonFromLLM(buildRepairPrompt(input));
+      const candidate = await generateJsonFromLLM(buildRepairPrompt(input), {});
       res.json({ recipe: parseRecipe(candidate) });
     } catch (error) {
       const status = error instanceof z.ZodError ? 400 : 500;
