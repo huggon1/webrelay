@@ -1,6 +1,8 @@
 import {
   createUrlPattern,
+  exportResultSchema,
   type ActionPreset,
+  type CodexProgressEvent,
   type ExportResult,
   type ExtractionProfile,
   type ExtractionRecipe,
@@ -12,6 +14,8 @@ import type {
   BackgroundRequest,
   BackgroundResponse,
 } from "./messages.js";
+
+const BACKEND_URL = "http://localhost:8787";
 
 // ── Messaging ──────────────────────────────────────────────────────────────
 
@@ -50,6 +54,100 @@ function setBtnLoading(id: string, loading: boolean) {
   }
 }
 
+function setProcessStage(message: string) {
+  el("cs-process-stage").textContent = message;
+}
+
+function resetProcessView(initialStage = "Preparing...") {
+  setProcessStage(initialStage);
+  el("cs-process-log").innerHTML = "";
+  el("cs-process-artifacts").innerHTML = "";
+}
+
+function appendProcessLog(kind: string, message: string, isError = false) {
+  const row = document.createElement("div");
+  row.className = `process-event${isError ? " process-event--error" : ""}`;
+  row.innerHTML = `
+    <span class="process-event-kind">${escapeHtml(kind)}</span>
+    <span class="process-event-message">${escapeHtml(message)}</span>
+  `;
+  const log = el("cs-process-log");
+  log.appendChild(row);
+  log.scrollTop = log.scrollHeight;
+}
+
+function appendProcessArtifact(label: string, content: unknown) {
+  const details = document.createElement("details");
+  details.className = "process-artifact";
+  details.open = true;
+  const text = typeof content === "string" ? content : JSON.stringify(content, null, 2);
+  details.innerHTML = `
+    <summary>${escapeHtml(label)}</summary>
+    <pre>${escapeHtml(text)}</pre>
+  `;
+  el("cs-process-artifacts").appendChild(details);
+}
+
+function handleProgressEvent(event: CodexProgressEvent) {
+  if (event.type === "stage") {
+    setProcessStage(event.message);
+    appendProcessLog("stage", event.message);
+  } else if (event.type === "reasoning") {
+    appendProcessLog("reason", event.message);
+  } else if (event.type === "artifact") {
+    appendProcessArtifact(event.label, event.content);
+  } else if (event.type === "usage") {
+    appendProcessLog("usage", `${event.usage.input_tokens} in / ${event.usage.output_tokens} out`);
+  } else if (event.type === "error") {
+    appendProcessLog("error", event.stage ? `${event.stage}: ${event.message}` : event.message, true);
+  }
+}
+
+async function streamBackend<T>(path: string, body: unknown): Promise<T> {
+  const response = await fetch(`${BACKEND_URL}${path}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok || !response.body) {
+    throw new Error(`Backend stream failed: ${response.status}`);
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let doneResult: T | undefined;
+
+  const consumeChunk = (chunk: string) => {
+    buffer += chunk;
+    const frames = buffer.split(/\n\n/);
+    buffer = frames.pop() ?? "";
+    for (const frame of frames) {
+      const dataLines = frame
+        .split(/\n/)
+        .filter((line) => line.startsWith("data:"))
+        .map((line) => line.slice(5).trimStart());
+      if (dataLines.length === 0) continue;
+      const event = JSON.parse(dataLines.join("\n")) as CodexProgressEvent;
+      handleProgressEvent(event);
+      if (event.type === "error") throw new Error(event.message);
+      if (event.type === "done") doneResult = event.result as T;
+    }
+  };
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    consumeChunk(decoder.decode(value, { stream: true }));
+  }
+  consumeChunk(decoder.decode());
+
+  if (doneResult === undefined) {
+    throw new Error("Backend stream ended without a final result.");
+  }
+  return doneResult;
+}
+
 function formatTimeAgo(iso?: string): string {
   if (!iso) return "Never";
   const diff = Date.now() - new Date(iso).getTime();
@@ -79,6 +177,15 @@ function escapeHtml(s: string): string {
 // ── Wizard state ───────────────────────────────────────────────────────────
 
 type WizardScreen = "entry" | "extracting" | "result" | "save" | "repair";
+
+type RefineStreamResult = {
+  artifact: {
+    recipe: ExtractionRecipe;
+    transform?: TransformSpec;
+    outputDescription?: string;
+  };
+  exportResult?: ExportResult;
+};
 
 const SCREEN_TO_STEP: Record<WizardScreen, number> = {
   entry: 0,
@@ -123,6 +230,36 @@ function updateStepIndicator(activeStep: number) {
     dot.classList.remove("step-dot--active", "step-dot--done");
     if (step < activeStep) dot.classList.add("step-dot--done");
     else if (step === activeStep) dot.classList.add("step-dot--active");
+  });
+}
+
+// ── Transform sandbox ─────────────────────────────────────────────────────
+
+function getSandboxFrame(): HTMLIFrameElement {
+  return document.getElementById("transform-sandbox") as HTMLIFrameElement;
+}
+
+async function runTransformInSandbox(transform: TransformSpec, data: unknown): Promise<ExportResult> {
+  const frame = getSandboxFrame();
+  const id = crypto.randomUUID();
+  return new Promise<ExportResult>((resolve, reject) => {
+    const timeout = window.setTimeout(() => {
+      window.removeEventListener("message", onMessage);
+      reject(new Error("Transform sandbox timed out."));
+    }, 3000);
+    function onMessage(event: MessageEvent) {
+      if (event.source !== frame.contentWindow || (event.data as { id?: string } | null)?.id !== id) return;
+      window.clearTimeout(timeout);
+      window.removeEventListener("message", onMessage);
+      const msg = event.data as { id: string; ok: boolean; exportResult?: unknown; error?: string };
+      if (msg.ok) {
+        resolve(exportResultSchema.parse(msg.exportResult));
+        return;
+      }
+      reject(new Error(msg.error || "Transform sandbox failed."));
+    }
+    window.addEventListener("message", onMessage);
+    frame.contentWindow?.postMessage({ id, type: "RUN_TRANSFORM", transform, data }, "*");
   });
 }
 
@@ -304,15 +441,56 @@ async function runProfile(profileId: string) {
   setStatus("Running...");
   const select = document.querySelector<HTMLSelectElement>(`.profile-action-select[data-id="${CSS.escape(profileId)}"]`);
   const actionPresetOverride = select ? { type: select.value as ActionPreset["type"] } : undefined;
-  const resp = await send({ type: "RUN_PROFILE", profileId, actionPresetOverride });
-  if (!resp.ok) { setStatus(resp.error, true); return; }
-  if (!("actionResult" in resp)) return;
 
-  const ar = resp.actionResult as ActionRunResult;
-  if (ar.errors.length > 0) {
-    setStatus(`Run failed: ${ar.errors[0]}`, true);
+  // Step 1: Run the recipe in background (handles status update, no transform/action)
+  const recipeResp = await send({ type: "RUN_RECIPE_FOR_PROFILE", profileId, actionPresetOverride });
+  if (!recipeResp.ok) { setStatus(recipeResp.error, true); return; }
+  if (!("result" in recipeResp) || !("profile" in recipeResp)) return;
+
+  const profile = recipeResp.profile as ExtractionProfile;
+  const result = recipeResp.result as ExtractionResult;
+
+  // Step 2: Run transform in sandbox (safe new Function via unsafe-eval iframe)
+  let exportResult: ExportResult;
+  if (profile.transform) {
+    try {
+      exportResult = await runTransformInSandbox(profile.transform, result.data);
+    } catch (err) {
+      setStatus(`Transform failed: ${err instanceof Error ? err.message : String(err)}`, true);
+      return;
+    }
   } else {
-    const parts = ([ar.copied && "Copied", ar.downloaded && "Downloaded"] as (string | false)[])
+    exportResult = { formatLabel: "JSON", content: JSON.stringify(result.data, null, 2), warnings: [] };
+  }
+
+  // Step 3: Apply action
+  const actionPreset = actionPresetOverride ?? profile.actionPreset;
+  const errors: string[] = [];
+  let copied = false;
+  let downloaded = false;
+
+  if (actionPreset.type === "copy" || actionPreset.type === "copy_download") {
+    try {
+      await navigator.clipboard.writeText(exportResult.content);
+      copied = true;
+    } catch (err) {
+      errors.push(`Copy failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  if (actionPreset.type === "download" || actionPreset.type === "copy_download") {
+    const dlResp = await send({ type: "DOWNLOAD_EXPORT", exportResult, profileId });
+    if (dlResp.ok) {
+      downloaded = true;
+    } else if (!dlResp.ok) {
+      errors.push(dlResp.error);
+    }
+  }
+
+  if (errors.length > 0) {
+    setStatus(`Run failed: ${errors[0]}`, true);
+  } else {
+    const parts = ([copied && "Copied", downloaded && "Downloaded"] as (string | false)[])
       .filter(Boolean)
       .join(" / ");
     setStatus(parts || "Done");
@@ -342,9 +520,11 @@ async function onExtract() {
 
 async function doExtractAndFormat() {
   showScreen("extracting");
+  resetProcessView("Preparing page snapshot");
 
   const snapshot = await ensureSnapshot();
   if (!snapshot) { showScreen("entry"); return; }
+  appendProcessLog("stage", "Captured page snapshot");
 
   let intent = wiz.intent;
   let confirmedFields: string[] | undefined;
@@ -359,24 +539,35 @@ async function doExtractAndFormat() {
     confirmedFields = ar.analysis.suggestedFields.map((f) => f.name);
     intent = confirmedFields.join(", ");
     wiz.intent = intent;
+    appendProcessLog("stage", "Auto-detected extraction intent");
   }
 
-  const gr = await send({
-    type: "GENERATE_RECIPE",
+  let gr: { recipe: ExtractionRecipe };
+  try {
+    gr = await streamBackend<{ recipe: ExtractionRecipe }>("/generate-recipe/stream", {
     intent,
     domSnapshot: snapshot,
     url: wiz.url,
     confirmedFields,
-  });
-
-  if (!gr.ok || !("recipe" in gr) || !("result" in gr)) {
-    setStatus(gr.ok ? "Recipe generation failed" : gr.error, true);
+    });
+  } catch (error) {
+    setStatus(error instanceof Error ? error.message : String(error), true);
     showScreen("entry");
     return;
   }
 
   wiz.recipe = gr.recipe;
-  wiz.result = gr.result;
+  appendProcessLog("stage", "Running recipe in current page");
+  const run = await send({ type: "RUN_RECIPE_PREVIEW", recipe: gr.recipe });
+  if (!run.ok || !("result" in run)) {
+    const message = run.ok ? "Recipe run failed" : run.error;
+    appendProcessLog("error", message, true);
+    setStatus(message, true);
+    showScreen("entry");
+    return;
+  }
+  wiz.result = run.result;
+  appendProcessArtifact("Extraction result", wiz.result.data);
 
   await applyAutoFormat();
   renderResult();
@@ -386,15 +577,17 @@ async function doExtractAndFormat() {
 async function applyAutoFormat(hint = "") {
   if (!wiz.result) return;
   const outputRequest = hint || "auto";
-  const fr = await send({
-    type: "GENERATE_TRANSFORM",
+  try {
+    const fr = await streamBackend<{ transform: TransformSpec | null; exportResult: ExportResult }>("/transform/stream", {
     outputRequest,
     intent: wiz.intent || "Extract the main content",
     result: wiz.result,
-  });
-  if (!fr.ok || !("transform" in fr)) return;
-  wiz.transform = fr.transform;
-  wiz.exportResult = fr.exportResult;
+    });
+    wiz.transform = fr.transform;
+    wiz.exportResult = fr.exportResult;
+  } catch (error) {
+    appendProcessLog("error", error instanceof Error ? error.message : String(error), true);
+  }
 }
 
 function renderResult() {
@@ -414,33 +607,56 @@ async function onRefine() {
 
   setBtnLoading("btn-refine", true);
   showScreen("extracting");
+  resetProcessView("Preparing refinement");
 
   const snapshot = await ensureSnapshot();
   if (!snapshot) { showScreen("result"); setBtnLoading("btn-refine", false); return; }
 
-  const rr = await send({
-    type: "REFINE_RECIPE",
-    feedback,
-    intent: wiz.intent || "Extract the main content",
-    currentRecipe: wiz.recipe,
-    currentResult: wiz.result,
-    domSnapshot: snapshot,
-    url: wiz.url,
-  });
-
-  if (!rr.ok || !("recipe" in rr)) {
-    setStatus(rr.ok ? "Refinement failed" : rr.error, true);
+  let rr: RefineStreamResult;
+  try {
+    rr = await streamBackend<RefineStreamResult>("/refine/stream", {
+      feedback,
+      intent: wiz.intent || "Extract the main content",
+      currentRecipe: wiz.recipe,
+      currentResult: wiz.result,
+      domSnapshot: snapshot,
+      url: wiz.url,
+    });
+  } catch (error) {
+    setStatus(error instanceof Error ? error.message : String(error), true);
     showScreen("result");
     setBtnLoading("btn-refine", false);
     return;
   }
 
-  wiz.recipe = rr.recipe;
-  wiz.result = rr.result;
+  wiz.recipe = rr.artifact.recipe;
+  appendProcessLog("stage", "Running refined recipe in current page");
+  const run = await send({ type: "RUN_RECIPE_PREVIEW", recipe: wiz.recipe });
+  if (!run.ok || !("result" in run)) {
+    const message = run.ok ? "Recipe run failed" : run.error;
+    appendProcessLog("error", message, true);
+    setStatus(message, true);
+    showScreen("result");
+    setBtnLoading("btn-refine", false);
+    return;
+  }
+  wiz.result = run.result;
+  appendProcessArtifact("Extraction result", wiz.result.data);
 
-  if ("transform" in rr && "exportResult" in rr) {
-    wiz.transform = rr.transform;
+  if (rr.exportResult) {
+    wiz.transform = rr.artifact.transform ?? null;
     wiz.exportResult = rr.exportResult;
+  } else if (rr.artifact.transform) {
+    appendProcessLog("stage", "Running refined transform preview");
+    const tr = await send({ type: "RUN_TRANSFORM_PREVIEW", transform: rr.artifact.transform, data: wiz.result.data });
+    if (tr.ok && "exportResult" in tr) {
+      wiz.transform = rr.artifact.transform;
+      wiz.exportResult = tr.exportResult;
+      appendProcessArtifact("Formatted preview", tr.exportResult.content);
+    } else {
+      appendProcessLog("error", tr.ok ? "Transform preview failed" : tr.error, true);
+      await applyAutoFormat();
+    }
   } else {
     await applyAutoFormat();
   }
@@ -469,26 +685,45 @@ async function onStartRepair() {
   if (!wiz.repairProfileId) return;
   const userNote = el<HTMLTextAreaElement>("cs-repair-note").value.trim() || undefined;
   showScreen("extracting");
+  resetProcessView("Preparing repair");
 
   const snapshot = await ensureSnapshot();
   if (!snapshot) { showScreen("repair"); return; }
 
-  const resp = await send({
-    type: "REPAIR_RECIPE",
-    profileId: wiz.repairProfileId,
-    domSnapshot: snapshot,
-    url: wiz.url,
-    userNote,
-  });
+  const profile = siteProfiles.find((p) => p.id === wiz.repairProfileId);
+  if (!profile) {
+    setStatus("Profile not found.", true);
+    showScreen("repair");
+    return;
+  }
 
-  if (!resp.ok || !("recipe" in resp) || !("result" in resp)) {
-    setStatus(resp.ok ? "Repair failed" : resp.error, true);
+  let resp: { recipe: ExtractionRecipe };
+  try {
+    resp = await streamBackend<{ recipe: ExtractionRecipe }>("/repair-recipe/stream", {
+      url: wiz.url,
+      intent: profile.intent,
+      domSnapshot: snapshot,
+      oldRecipe: profile.recipe,
+      userNote,
+    });
+  } catch (error) {
+    setStatus(error instanceof Error ? error.message : String(error), true);
     showScreen("repair");
     return;
   }
 
   wiz.recipe = resp.recipe;
-  wiz.result = resp.result;
+  appendProcessLog("stage", "Running repaired recipe in current page");
+  const run = await send({ type: "RUN_RECIPE_PREVIEW", recipe: resp.recipe });
+  if (!run.ok || !("result" in run)) {
+    const message = run.ok ? "Recipe run failed" : run.error;
+    appendProcessLog("error", message, true);
+    setStatus(message, true);
+    showScreen("repair");
+    return;
+  }
+  wiz.result = run.result;
+  appendProcessArtifact("Extraction result", wiz.result.data);
 
   await applyAutoFormat();
   renderResult();

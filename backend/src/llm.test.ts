@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { extractionRecipeSchema } from "@extractor/shared";
-import { parseCodexFinalResponse, recipeOutputSchema } from "./llm.js";
+import { collectFinalResponseFromEvents, parseCodexFinalResponse, recipeOutputSchema } from "./llm.js";
 
 describe("Codex recipe output", () => {
   it("parses strict JSON final responses", () => {
@@ -62,5 +62,34 @@ describe("Codex recipe output", () => {
     expect(fieldSchema.additionalProperties).toBe(false);
     expect(fieldSchema.required).toEqual(["name", "selector", "value", "attribute", "required"]);
     expect(Object.keys(fieldSchema.properties)).not.toContain("code");
+  });
+
+  it("collects streamed Codex events and forwards progress", async () => {
+    async function* events() {
+      yield { type: "thread.started", thread_id: "thread-1" };
+      yield { type: "turn.started" };
+      yield { type: "item.completed", item: { id: "r1", type: "reasoning", text: "Chose h1 because it is the page title." } };
+      yield { type: "item.completed", item: { id: "m1", type: "agent_message", text: '{"version":1,"mode":"single","rootSelector":null,"fields":[]}' } };
+      yield {
+        type: "turn.completed",
+        usage: { input_tokens: 10, cached_input_tokens: 0, output_tokens: 5, reasoning_output_tokens: 2 },
+      };
+    }
+
+    const progress: string[] = [];
+    const finalResponse = await collectFinalResponseFromEvents(events() as never, (event) => {
+      progress.push(event.type);
+    });
+
+    expect(finalResponse).toContain('"version":1');
+    expect(progress).toEqual(["stage", "stage", "reasoning", "usage"]);
+  });
+
+  it("throws when streamed Codex turn fails", async () => {
+    async function* events() {
+      yield { type: "turn.failed", error: { message: "Codex failed" } };
+    }
+
+    await expect(collectFinalResponseFromEvents(events() as never)).rejects.toThrow("Codex failed");
   });
 });

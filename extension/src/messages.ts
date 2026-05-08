@@ -45,12 +45,8 @@ export type BackgroundRequest =
 
   // ── Quick Run (purely frontend, no Codex required) ────────────────────
   | { type: "LIST_PROFILES_FOR_SITE"; url: string }
-  | {
-      type: "RUN_PROFILE";
-      profileId: string;
-      /** Override the profile's saved actionPreset for this run */
-      actionPresetOverride?: ActionPreset;
-    }
+  | { type: "RUN_RECIPE_FOR_PROFILE"; profileId: string; actionPresetOverride?: ActionPreset }
+  | { type: "DOWNLOAD_EXPORT"; exportResult: ExportResult; profileId?: string }
 
   // ── Codex Studio — Entry A: auto-analyze page ─────────────────────────
   | { type: "ANALYZE_INTENT"; domSnapshot: string; url: string }
@@ -64,6 +60,7 @@ export type BackgroundRequest =
       /** Confirmed field names from ANALYZE_INTENT proposal (optional) */
       confirmedFields?: string[];
     }
+  | { type: "RUN_RECIPE_PREVIEW"; recipe: ExtractionRecipe }
 
   // ── Codex Studio — Step 3: refine recipe based on feedback ────────────
   | {
@@ -82,6 +79,11 @@ export type BackgroundRequest =
       outputRequest: string;
       intent: string;
       result: ExtractionResult;
+    }
+  | {
+      type: "RUN_TRANSFORM_PREVIEW";
+      transform: TransformSpec;
+      data: unknown;
     }
 
   // ── Codex Studio — Entry C: repair a failed profile ───────────────────
@@ -108,7 +110,8 @@ export type BackgroundResponse =
   | { ok: true; recipe: ExtractionRecipe; result: ExtractionResult }
   | { ok: true; recipe: ExtractionRecipe; result: ExtractionResult; transform: TransformSpec | null; exportResult: ExportResult }
   | { ok: true; transform: TransformSpec | null; exportResult: ExportResult }
-  | { ok: true; result: ExtractionResult; exportResult?: ExportResult; actionResult: ActionRunResult }
+  | { ok: true; result: ExtractionResult; profile: ExtractionProfile }
+  | { ok: true; downloaded: boolean }
   | { ok: false; error: string };
 
 export interface ActionRunResult {

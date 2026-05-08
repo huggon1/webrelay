@@ -1,4 +1,5 @@
-import { Codex, type ModelReasoningEffort, type ThreadOptions } from "@openai/codex-sdk";
+import { Codex, type ModelReasoningEffort, type ThreadEvent, type ThreadOptions } from "@openai/codex-sdk";
+import type { CodexProgressEvent } from "@extractor/shared";
 
 export const recipeOutputSchema = {
   type: "object",
@@ -93,6 +94,8 @@ export type CodexJsonOptions = {
   workingDirectory?: string;
 };
 
+export type CodexProgressCallback = (event: CodexProgressEvent) => void;
+
 function parseJsonText(text: string) {
   const trimmed = text.trim();
   if (!trimmed) throw new Error("Codex returned an empty response.");
@@ -180,10 +183,68 @@ Hard constraints:
 ${codeRule}
 - Do not output markdown or explanations.
 - Your final response must be one JSON object that matches the provided output schema.
+- When the SDK emits reasoning summaries, keep them brief and focused on selector choice, extraction mode, validation risks, and output formatting decisions.
 
 Task:
 ${prompt}
 `;
+}
+
+export async function collectFinalResponseFromEvents(
+  events: AsyncIterable<ThreadEvent>,
+  onProgress?: CodexProgressCallback,
+) {
+  let finalResponse = "";
+  const seenReasoning = new Set<string>();
+
+  for await (const event of events) {
+    if (event.type === "thread.started") {
+      onProgress?.({ type: "stage", message: `Codex thread started: ${event.thread_id}` });
+      continue;
+    }
+
+    if (event.type === "turn.started") {
+      onProgress?.({ type: "stage", message: "Generating structured output" });
+      continue;
+    }
+
+    if (event.type === "item.completed" || event.type === "item.updated") {
+      const item = event.item;
+      if (item.type === "reasoning" && item.text.trim()) {
+        const key = `${item.id}:${item.text}`;
+        if (!seenReasoning.has(key)) {
+          seenReasoning.add(key);
+          onProgress?.({ type: "reasoning", message: item.text });
+        }
+      }
+      if (event.type === "item.completed" && item.type === "agent_message") {
+        finalResponse = item.text;
+      }
+      if (event.type === "item.completed" && item.type === "error") {
+        onProgress?.({ type: "error", message: item.message });
+      }
+      continue;
+    }
+
+    if (event.type === "turn.completed") {
+      onProgress?.({ type: "usage", usage: event.usage });
+      continue;
+    }
+
+    if (event.type === "turn.failed") {
+      throw new Error(event.error.message);
+    }
+
+    if (event.type === "error") {
+      throw new Error(event.message);
+    }
+  }
+
+  if (!finalResponse.trim()) {
+    throw new Error("Codex did not return a final response.");
+  }
+
+  return finalResponse;
 }
 
 export async function generateJsonWithSchema(
@@ -199,6 +260,31 @@ export async function generateJsonWithSchema(
   return parseCodexJsonResponse(turn.finalResponse);
 }
 
+export async function generateJsonWithSchemaStreamed(
+  prompt: string,
+  outputSchema: object,
+  options: CodexJsonOptions & { allowTransformCode?: boolean } = {},
+  onProgress?: CodexProgressCallback,
+) {
+  const codex = new Codex();
+  const thread = codex.startThread(buildThreadOptions(options));
+  onProgress?.({ type: "stage", message: "Starting read-only Codex thread" });
+  const { events } = await thread.runStreamed(buildCodexPrompt(prompt, options), {
+    outputSchema,
+  });
+  const finalResponse = await collectFinalResponseFromEvents(events, onProgress);
+  onProgress?.({ type: "stage", message: "Parsing structured JSON" });
+  return parseCodexJsonResponse(finalResponse);
+}
+
 export async function generateJsonFromLLM(prompt: string, options: CodexJsonOptions = {}) {
   return generateJsonWithSchema(prompt, recipeOutputSchema, options);
+}
+
+export async function generateJsonFromLLMStreamed(
+  prompt: string,
+  options: CodexJsonOptions = {},
+  onProgress?: CodexProgressCallback,
+) {
+  return generateJsonWithSchemaStreamed(prompt, recipeOutputSchema, options, onProgress);
 }

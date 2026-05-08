@@ -49,7 +49,11 @@
 
         <!-- Screen: Extracting (loading) -->
         <div id="cs-extracting" class="cs-screen hidden">
-          <p class="cs-loading">Analyzing, extracting, and formatting...</p>
+          <div class="process-header">
+            <p id="cs-process-stage" class="process-stage">Preparing...</p>
+          </div>
+          <div id="cs-process-log" class="process-log" aria-live="polite"></div>
+          <div id="cs-process-artifacts" class="process-artifacts"></div>
         </div>
 
         <!-- Screen: Result (formatted output + feedback) -->
@@ -101,6 +105,7 @@
 
       <p id="status-bar" class="status-bar"></p>
     </main>
+    <iframe id="transform-sandbox" src="sandbox.html" style="display:none" sandbox="allow-scripts allow-same-origin"></iframe>
     <script type="module" src="popup.js"></script>
   </body>
 </html>

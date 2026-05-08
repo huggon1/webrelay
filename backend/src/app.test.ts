@@ -3,16 +3,21 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("./llm.js", () => ({
   generateJsonFromLLM: vi.fn(),
+  generateJsonFromLLMStreamed: vi.fn(),
   generateJsonWithSchema: vi.fn(),
+  generateJsonWithSchemaStreamed: vi.fn(),
   transformOutputSchema: {},
   artifactOutputSchema: {},
+  intentAnalysisOutputSchema: {},
 }));
 
 const { createApp } = await import("./app.js");
-const { generateJsonFromLLM, generateJsonWithSchema } = await import("./llm.js");
+const { generateJsonFromLLM, generateJsonFromLLMStreamed, generateJsonWithSchema, generateJsonWithSchemaStreamed } = await import("./llm.js");
 
 const mockedGenerateJson = vi.mocked(generateJsonFromLLM);
+const mockedGenerateJsonStreamed = vi.mocked(generateJsonFromLLMStreamed);
 const mockedGenerateJsonWithSchema = vi.mocked(generateJsonWithSchema);
+const mockedGenerateJsonWithSchemaStreamed = vi.mocked(generateJsonWithSchemaStreamed);
 
 const validRecipe = {
   version: 1,
@@ -30,7 +35,9 @@ const validDebug = {
 describe("backend app with Codex provider", () => {
   beforeEach(() => {
     mockedGenerateJson.mockReset();
+    mockedGenerateJsonStreamed.mockReset();
     mockedGenerateJsonWithSchema.mockReset();
+    mockedGenerateJsonWithSchemaStreamed.mockReset();
   });
 
   it("reports Codex provider in health", async () => {
@@ -52,6 +59,27 @@ describe("backend app with Codex provider", () => {
 
     expect(response.body.recipe).toEqual(validRecipe);
     expect(mockedGenerateJson).toHaveBeenCalledTimes(1);
+  });
+
+  it("streams recipe generation progress through SSE", async () => {
+    mockedGenerateJsonStreamed.mockImplementation(async (_prompt, _options, onProgress) => {
+      onProgress?.({ type: "reasoning", message: "Use the page heading selector." });
+      return validRecipe;
+    });
+
+    const response = await request(createApp())
+      .post("/generate-recipe/stream")
+      .send({
+        url: "https://example.com/page",
+        intent: "Extract title",
+        domSnapshot: "<h1>Hello</h1>",
+      })
+      .expect(200);
+
+    expect(response.headers["content-type"]).toContain("text/event-stream");
+    expect(response.text).toContain('"type":"reasoning"');
+    expect(response.text).toContain('"type":"done"');
+    expect(response.text).toContain('"recipe"');
   });
 
   it("repairs a recipe through Codex", async () => {
@@ -152,6 +180,36 @@ describe("backend app with Codex provider", () => {
 
     expect(response.body.transform.formatLabel).toBe("Markdown");
     expect(response.body.exportResult.content).toBe("# Hello");
+  });
+
+  it("streams transform generation and preview through SSE", async () => {
+    mockedGenerateJsonWithSchemaStreamed.mockImplementation(async (_prompt, _schema, _options, onProgress) => {
+      onProgress?.({ type: "reasoning", message: "Markdown fits this single title." });
+      return {
+        version: 1,
+        formatLabel: "Markdown",
+        outputDescription: "Title as markdown",
+        code: "return `# ${input.title}`;",
+      };
+    });
+
+    const response = await request(createApp())
+      .post("/transform/stream")
+      .send({
+        intent: "Extract title",
+        outputRequest: "Convert to markdown",
+        result: {
+          ok: true,
+          data: { title: "Hello" },
+          debug: { mode: "single", rootMatchCount: 1, fields: [], errors: [] },
+        },
+      })
+      .expect(200);
+
+    expect(response.headers["content-type"]).toContain("text/event-stream");
+    expect(response.text).toContain('"type":"reasoning"');
+    expect(response.text).toContain('"Transform code"');
+    expect(response.text).toContain("# Hello");
   });
 
   it("returns a local preview instead of executing risky export requests", async () => {

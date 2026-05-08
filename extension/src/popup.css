@@ -337,6 +337,77 @@ button:disabled {
   padding: 24px 0;
 }
 
+.process-header {
+  display: grid;
+  gap: 4px;
+}
+
+.process-stage {
+  font-size: 13px;
+  font-weight: 700;
+  color: #172026;
+}
+
+.process-log {
+  box-sizing: border-box;
+  display: grid;
+  gap: 6px;
+  max-height: 150px;
+  overflow: auto;
+  border: 1px solid #dde3e8;
+  border-radius: 6px;
+  padding: 8px;
+  background: #fff;
+}
+
+.process-event {
+  display: grid;
+  grid-template-columns: 72px 1fr;
+  gap: 8px;
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.process-event-kind {
+  color: #52616b;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.process-event-message {
+  color: #172026;
+  overflow-wrap: anywhere;
+}
+
+.process-event--error .process-event-message {
+  color: #cf222e;
+}
+
+.process-artifacts {
+  display: grid;
+  gap: 6px;
+}
+
+.process-artifact {
+  border: 1px solid #dde3e8;
+  border-radius: 6px;
+  background: #fff;
+}
+
+.process-artifact summary {
+  cursor: pointer;
+  padding: 7px 8px;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.process-artifact pre {
+  max-height: 130px;
+  margin: 0;
+  border-width: 1px 0 0;
+  border-radius: 0 0 6px 6px;
+}
+
 /* ── Codex Studio header ─────────────────────────────────────────────────── */
 
 .cs-header {

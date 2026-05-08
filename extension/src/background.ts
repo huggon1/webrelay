@@ -26,6 +26,7 @@ const BACKEND_URL = "http://localhost:8787";
 const PROFILES_KEY = "profiles";
 const LAST_USED_BY_SITE_KEY = "lastUsedBySite";
 const OFFSCREEN_COPY_MESSAGE = "OFFSCREEN_COPY";
+const OFFSCREEN_TRANSFORM_MESSAGE = "OFFSCREEN_TRANSFORM";
 
 // ── Tab utilities ──────────────────────────────────────────────────────────
 
@@ -149,26 +150,22 @@ async function getLastUsedProfileForSite(urlValue: string): Promise<ExtractionPr
   return profiles.find((p) => p.id === state.configurationId && matchesUrlPattern(p.urlPattern, urlValue)) ?? null;
 }
 
-// ── Transform execution (runs in page context to allow new Function) ───────
+// ── Transform execution (relayed through offscreen sandbox for new Function) ─
 
-async function runTransformInPage(tabId: number, transform: import("@extractor/shared").TransformSpec, data: unknown): Promise<ExportResult> {
-  try {
-    const [{ result: output }] = await chrome.scripting.executeScript({
-      target: { tabId },
-      args: [transform.code, data],
-      func: (code: string, input: unknown): string => {
-        // eslint-disable-next-line no-new-func
-        const fn = new Function("input", code) as (input: unknown) => string;
-        return fn(input);
-      },
-    });
-    if (typeof output !== "string") throw new Error("Transform did not return a string.");
-    return { formatLabel: transform.formatLabel, content: output, warnings: [] };
-  } catch (error) {
-    const raw = fallbackExportResult(data);
-    raw.warnings.push(`Transform failed: ${error instanceof Error ? error.message : String(error)}`);
-    return raw;
+async function runTransformViaOffscreen(transform: import("@extractor/shared").TransformSpec, data: unknown): Promise<ExportResult> {
+  await ensureOffscreenDocument();
+  const id = crypto.randomUUID();
+  const response = await chrome.runtime.sendMessage({
+    type: OFFSCREEN_TRANSFORM_MESSAGE,
+    id,
+    transform,
+    data,
+  }) as { ok: true; exportResult: ExportResult } | { ok: false; error: string } | undefined;
+
+  if (!response?.ok) {
+    throw new Error(response?.error ?? "Transform failed: no response from offscreen.");
   }
+  return exportResultSchema.parse(response.exportResult);
 }
 
 // ── Action execution ───────────────────────────────────────────────────────
@@ -205,8 +202,8 @@ async function ensureOffscreenDocument() {
 
   await chrome.offscreen.createDocument({
     url: "offscreen.html",
-    reasons: [chrome.offscreen.Reason.CLIPBOARD],
-    justification: "Write WebRelay extraction results to the clipboard.",
+    reasons: [chrome.offscreen.Reason.CLIPBOARD, chrome.offscreen.Reason.IFRAME_SCRIPTING],
+    justification: "Write extraction results to the clipboard and run transforms in a sandboxed iframe.",
   });
 }
 
@@ -270,7 +267,7 @@ async function runProfile(profileId: string, actionPresetOverride?: ActionPreset
 
   const result = contentResponse.result;
   const exportResult: ExportResult = profile.transform
-    ? await runTransformInPage(tab.id, profile.transform, result.data)
+    ? await runTransformViaOffscreen(profile.transform, result.data)
     : fallbackExportResult(result.data);
 
   const actionPreset = actionPresetOverride ? actionPresetSchema.parse(actionPresetOverride) : profile.actionPreset;
@@ -309,6 +306,7 @@ async function postBackend(path: string, body: unknown) {
 chrome.runtime.onMessage.addListener(
   (message: BackgroundRequest, _sender, sendResponse: (response: BackgroundResponse) => void) => {
     if ((message as { type?: string }).type === OFFSCREEN_COPY_MESSAGE) return false;
+    if ((message as { type?: string }).type === OFFSCREEN_TRANSFORM_MESSAGE) return false;
 
     void (async () => {
       try {
@@ -336,9 +334,36 @@ chrome.runtime.onMessage.addListener(
           return;
         }
 
-        if (message.type === "RUN_PROFILE") {
-          const response = await runProfile(message.profileId, message.actionPresetOverride);
-          sendResponse({ ok: true, ...response });
+        if (message.type === "RUN_RECIPE_FOR_PROFILE") {
+          const tab = await getActiveTab();
+          const profile = (await getProfiles()).find(
+            (p) => p.id === message.profileId && matchesUrlPattern(p.urlPattern, tab.url),
+          );
+          if (!profile) throw new Error("No matching saved configuration was found.");
+          const contentResponse = await sendToContentByActiveTab({ type: "RUN_RECIPE", recipe: profile.recipe });
+          if (!contentResponse.ok) throw new Error(contentResponse.error);
+          if (!("result" in contentResponse)) throw new Error("Profile run response was incomplete.");
+          const result = contentResponse.result;
+          const now = new Date().toISOString();
+          const hostnameUrlPattern = createUrlPattern(tab.url);
+          if (!result.ok || (result.ok && result.debug.rootMatchCount === 0 && result.debug.mode === "list")) {
+            await updateProfile(message.profileId, { status: "possibly_failed", urlPattern: hostnameUrlPattern, lastRunAt: now, updatedAt: now });
+          } else {
+            const effectiveActionPreset = message.actionPresetOverride
+              ? actionPresetSchema.parse(message.actionPresetOverride)
+              : profile.actionPreset;
+            await updateProfile(message.profileId, { status: "ok", urlPattern: hostnameUrlPattern, lastRunAt: now, updatedAt: now });
+            await updateLastUsed(profile, effectiveActionPreset, tab.url);
+          }
+          const updatedProfile = (await getProfiles()).find((p) => p.id === message.profileId) ?? profile;
+          sendResponse({ ok: true, result, profile: updatedProfile });
+          return;
+        }
+
+        if (message.type === "DOWNLOAD_EXPORT") {
+          const profile = message.profileId ? (await getProfiles()).find((p) => p.id === message.profileId) : undefined;
+          await downloadExportContent(message.exportResult, profile);
+          sendResponse({ ok: true, downloaded: true });
           return;
         }
 
@@ -367,6 +392,15 @@ chrome.runtime.onMessage.addListener(
           return;
         }
 
+        if (message.type === "RUN_RECIPE_PREVIEW") {
+          const recipe = extractionRecipeSchema.parse(message.recipe);
+          const contentResponse = await sendToContentByActiveTab({ type: "RUN_RECIPE", recipe });
+          if (!contentResponse.ok) throw new Error(contentResponse.error);
+          if (!("result" in contentResponse)) throw new Error("Recipe run response incomplete.");
+          sendResponse({ ok: true, recipe, result: contentResponse.result });
+          return;
+        }
+
         if (message.type === "REFINE_RECIPE") {
           const payload = await postBackend("/refine", {
             url: message.url,
@@ -385,7 +419,7 @@ chrome.runtime.onMessage.addListener(
           if (!("result" in contentResponse)) throw new Error("Recipe run response incomplete.");
           const result = contentResponse.result;
           const exportResult = transform
-            ? await runTransformInPage(tab.id, transform, result.data)
+            ? await runTransformViaOffscreen(transform, result.data)
             : fallbackExportResult(result.data);
           sendResponse({ ok: true, recipe, result, transform, exportResult });
           return;
@@ -402,6 +436,14 @@ chrome.runtime.onMessage.addListener(
             transform: payload.transform ? transformSpecSchema.parse(payload.transform) : null,
             exportResult: exportResultSchema.parse(payload.exportResult),
           });
+          return;
+        }
+
+        if (message.type === "RUN_TRANSFORM_PREVIEW") {
+          const tab = await getActiveTab();
+          const transform = transformSpecSchema.parse(message.transform);
+          const exportResult = await runTransformViaOffscreen(transform, message.data);
+          sendResponse({ ok: true, transform, exportResult });
           return;
         }
 

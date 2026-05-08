@@ -3,6 +3,15 @@ type OffscreenCopyRequest = {
   content: string;
 };
 
+type OffscreenTransformRequest = {
+  type: "OFFSCREEN_TRANSFORM";
+  id: string;
+  transform: { code: string; formatLabel: string };
+  data: unknown;
+};
+
+type OffscreenRequest = OffscreenCopyRequest | OffscreenTransformRequest;
+
 function copyWithHiddenTextarea(content: string) {
   const textarea = document.createElement("textarea");
   textarea.value = content;
@@ -23,14 +32,70 @@ function copyWithHiddenTextarea(content: string) {
   if (!copied) throw new Error("document.execCommand('copy') returned false.");
 }
 
-chrome.runtime.onMessage.addListener((message: OffscreenCopyRequest, _sender, sendResponse) => {
-  if (message.type !== "OFFSCREEN_COPY") return false;
+// ── Sandbox transform relay ────────────────────────────────────────────────
 
-  try {
-    copyWithHiddenTextarea(message.content);
-    sendResponse({ ok: true });
-  } catch (error) {
-    sendResponse({ ok: false, error: error instanceof Error ? error.message : String(error) });
+const sandboxFrame = document.getElementById("transform-sandbox") as HTMLIFrameElement;
+let sandboxReady = false;
+const pendingTransforms = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
+
+sandboxFrame.addEventListener("load", () => { sandboxReady = true; }, { once: true });
+
+window.addEventListener("message", (event: MessageEvent) => {
+  if (event.source !== sandboxFrame.contentWindow) return;
+  const msg = event.data as { id?: string; ok?: boolean; exportResult?: unknown; error?: string } | null;
+  if (!msg?.id) return;
+  const pending = pendingTransforms.get(msg.id);
+  if (!pending) return;
+  pendingTransforms.delete(msg.id);
+  if (msg.ok) {
+    pending.resolve(msg.exportResult);
+  } else {
+    pending.reject(new Error(msg.error ?? "Sandbox transform failed."));
+  }
+});
+
+function waitForSandbox(): Promise<void> {
+  return new Promise<void>((resolve) => {
+    if (sandboxReady) { resolve(); return; }
+    sandboxFrame.addEventListener("load", () => resolve(), { once: true });
+  });
+}
+
+// ── Message handler ────────────────────────────────────────────────────────
+
+chrome.runtime.onMessage.addListener((message: OffscreenRequest, _sender, sendResponse) => {
+  if (message.type === "OFFSCREEN_COPY") {
+    try {
+      copyWithHiddenTextarea(message.content);
+      sendResponse({ ok: true });
+    } catch (error) {
+      sendResponse({ ok: false, error: error instanceof Error ? error.message : String(error) });
+    }
+    return false;
+  }
+
+  if (message.type === "OFFSCREEN_TRANSFORM") {
+    const { id, transform, data } = message;
+    void waitForSandbox().then(() => {
+      const timeoutId = window.setTimeout(() => {
+        pendingTransforms.delete(id);
+        sendResponse({ ok: false, error: "Transform sandbox timed out." });
+      }, 5000);
+
+      pendingTransforms.set(id, {
+        resolve: (exportResult) => {
+          window.clearTimeout(timeoutId);
+          sendResponse({ ok: true, exportResult });
+        },
+        reject: (error: Error) => {
+          window.clearTimeout(timeoutId);
+          sendResponse({ ok: false, error: error.message });
+        },
+      });
+
+      sandboxFrame.contentWindow?.postMessage({ id, type: "RUN_TRANSFORM", transform, data }, "*");
+    });
+    return true; // keep channel open for async response
   }
 
   return false;
