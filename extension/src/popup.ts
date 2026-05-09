@@ -1,19 +1,14 @@
 import {
   actionPresetSchema,
   createUrlPattern,
-  extractionArtifactSchema,
   extractionProfileSchema,
   extractionRecipeSchema,
   matchesUrlPattern,
   type ActionPreset,
-  type CodexProgressEvent,
-  type ExtractionArtifact,
   type ExtractionProfile,
 } from "@extractor/shared";
-import type { BackgroundRequest, BackgroundResponse, GenerateArtifactRequest } from "./messages.js";
+import type { BackgroundRequest, BackgroundResponse, GenerateArtifactRequest, StudioJob } from "./messages.js";
 import { selectGenerateMode } from "./studio-mode.js";
-
-const BACKEND_URL = "http://localhost:8787";
 
 const sampleRecipe = {
   version: 1,
@@ -36,6 +31,7 @@ let profiles: ExtractionProfile[] = [];
 let editingProfile: ExtractionProfile | null = null;
 let editorSource: "manual-new" | "manual-edit" | "studio-candidate" = "manual-new";
 let listScope: "current" | "all" = "current";
+let studioPollTimer: number | undefined;
 
 function el<T extends HTMLElement>(id: string): T {
   const node = document.getElementById(id);
@@ -49,6 +45,7 @@ async function send(message: BackgroundRequest): Promise<BackgroundResponse> {
 
 function switchTab(tab: "quickrun" | "studio") {
   const isQuickRun = tab === "quickrun";
+  if (isQuickRun) stopStudioPolling();
   el("panel-quickrun").classList.toggle("hidden", !isQuickRun);
   el("panel-studio").classList.toggle("hidden", isQuickRun);
   el("screen-edit").classList.add("hidden");
@@ -128,7 +125,7 @@ function showEditor(
   el("editor-title").textContent = editorSource === "manual-edit" ? "Edit Profile" : "New Profile";
   const nameInput = el<HTMLInputElement>("profile-name");
   nameInput.value = editorSource === "manual-edit" ? profile?.name ?? "" : "";
-  nameInput.placeholder = options.namePlaceholder ?? (editorSource === "manual-edit" ? "Profile name" : "Chat to Markdown");
+  nameInput.placeholder = editorSource === "manual-edit" ? "Profile name" : "";
   el<HTMLInputElement>("profile-url-pattern").value = profile?.urlPattern ?? createUrlPattern(currentUrl);
   el<HTMLSelectElement>("profile-action").value = profile?.actionPreset.type ?? "copy";
   el<HTMLTextAreaElement>("profile-recipe").value = JSON.stringify(profile?.recipe ?? sampleRecipe, null, 2);
@@ -345,9 +342,11 @@ async function deleteProfile(profileId: string) {
 }
 
 function showStudioEntry() {
+  stopStudioPolling();
   el("studio-entry").classList.remove("hidden");
   el("studio-generating").classList.add("hidden");
   clearStudioProcess();
+  setStudioControls(null);
 }
 
 function showStudioGenerating(initialStage: string) {
@@ -355,6 +354,7 @@ function showStudioGenerating(initialStage: string) {
   el("studio-generating").classList.remove("hidden");
   clearStudioProcess();
   setStudioStage(initialStage);
+  setStudioControls("running");
 }
 
 function setStudioStage(message: string) {
@@ -364,6 +364,11 @@ function setStudioStage(message: string) {
 function clearStudioProcess() {
   el("studio-log").innerHTML = "";
   el("studio-artifacts").innerHTML = "";
+}
+
+function setStudioControls(status: StudioJob["status"] | null) {
+  el<HTMLButtonElement>("btn-cancel-studio").classList.toggle("hidden", status !== "running");
+  el<HTMLButtonElement>("btn-clear-studio").classList.toggle("hidden", status === "running" || status === null);
 }
 
 function appendProcessLog(kind: string, message: string, isError = false) {
@@ -387,7 +392,7 @@ function appendArtifact(label: string, content: unknown) {
   el("studio-artifacts").append(details);
 }
 
-function handleProgressEvent(event: CodexProgressEvent) {
+function handleProgressEvent(event: StudioJob["events"][number]) {
   if (event.type === "stage") {
     setStudioStage(event.message);
     appendProcessLog("stage", event.message);
@@ -400,63 +405,6 @@ function handleProgressEvent(event: CodexProgressEvent) {
   } else if (event.type === "error") {
     appendProcessLog("error", event.stage ? `${event.stage}: ${event.message}` : event.message, true);
   }
-}
-
-async function streamBackend<T>(path: string, body: unknown): Promise<T> {
-  const response = await fetch(`${BACKEND_URL}${path}`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  if (!response.ok || !response.body) throw new Error(`Backend stream failed: ${response.status}`);
-
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-  let doneResult: T | undefined;
-
-  const consumeChunk = (chunk: string) => {
-    buffer += chunk;
-    const frames = buffer.split(/\n\n/);
-    buffer = frames.pop() ?? "";
-    for (const frame of frames) {
-      const dataLines = frame
-        .split(/\n/)
-        .filter((line) => line.startsWith("data:"))
-        .map((line) => line.slice(5).trimStart());
-      if (dataLines.length === 0) continue;
-      const event = JSON.parse(dataLines.join("\n")) as CodexProgressEvent;
-      handleProgressEvent(event);
-      if (event.type === "error") throw new Error(event.message);
-      if (event.type === "done") doneResult = event.result as T;
-    }
-  };
-
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    consumeChunk(decoder.decode(value, { stream: true }));
-  }
-  consumeChunk(decoder.decode());
-
-  if (doneResult === undefined) throw new Error("Backend stream ended without a final result.");
-  return doneResult;
-}
-
-function buildProfileFromArtifact(artifact: ExtractionArtifact, baseProfile: ExtractionProfile | null): ExtractionProfile {
-  const now = new Date().toISOString();
-  return extractionProfileSchema.parse({
-    id: `profile-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-    name: "Generated candidate",
-    urlPattern: baseProfile?.urlPattern ?? createUrlPattern(currentUrl),
-    recipe: artifact.recipe,
-    script: artifact.script,
-    actionPreset: baseProfile?.actionPreset ?? { type: "copy" },
-    status: "ok",
-    createdAt: now,
-    updatedAt: now,
-    version: 1,
-  });
 }
 
 async function runBaseProfileForRevise(baseProfile: ExtractionProfile) {
@@ -475,8 +423,113 @@ async function runBaseProfileForRevise(baseProfile: ExtractionProfile) {
   };
 }
 
+function stopStudioPolling() {
+  if (studioPollTimer !== undefined) {
+    window.clearInterval(studioPollTimer);
+    studioPollTimer = undefined;
+  }
+}
+
+function startStudioPolling() {
+  if (studioPollTimer !== undefined) return;
+  studioPollTimer = window.setInterval(() => {
+    void refreshStudioJob();
+  }, 800);
+}
+
+function renderStudioEvents(job: StudioJob) {
+  clearStudioProcess();
+  for (const event of job.events) {
+    handleProgressEvent(event);
+  }
+}
+
+function latestStudioStage(job: StudioJob) {
+  const lastStage = [...job.events].reverse().find((event) => event.type === "stage" || event.type === "error");
+  if (lastStage?.type === "stage") return lastStage.message;
+  if (lastStage?.type === "error") return lastStage.message;
+  if (job.status === "cancelled") return "Cancelled";
+  if (job.status === "error") return "Generation failed";
+  if (job.status === "done") return "Generated profile preview complete";
+  return "Working...";
+}
+
+function renderStudioJob(job: StudioJob | null) {
+  if (!job) {
+    showStudioEntry();
+    return;
+  }
+
+  if (job.status === "done" && job.candidateProfile && job.preview) {
+    stopStudioPolling();
+    showEditor(job.candidateProfile, {
+      source: "studio-candidate",
+    });
+    el("preview-input").textContent = job.preview.scriptInput;
+    el("preview-output").textContent = job.preview.output;
+    el<HTMLDetailsElement>("preview-panel").open = true;
+    setStatus(
+      job.preview.extraction.ok ? "Generated profile preview complete." : "Generated profile has extraction warnings.",
+      !job.preview.extraction.ok,
+    );
+    return;
+  }
+
+  el("studio-entry").classList.add("hidden");
+  el("studio-generating").classList.remove("hidden");
+  renderStudioEvents(job);
+  setStudioStage(latestStudioStage(job));
+  setStudioControls(job.status);
+
+  if (job.status === "running") {
+    startStudioPolling();
+    return;
+  }
+
+  stopStudioPolling();
+  if (job.status === "cancelled") {
+    setStatus("Generation cancelled.", true);
+  } else if (job.status === "error") {
+    setStatus(job.error || "Generation failed.", true);
+  }
+}
+
+async function refreshStudioJob() {
+  const response = await send({ type: "GET_STUDIO_JOB" });
+  if (!response.ok || !("job" in response)) {
+    setStatus(response.ok ? "Could not load Studio job." : response.error, true);
+    stopStudioPolling();
+    return;
+  }
+  renderStudioJob(response.job);
+}
+
+async function clearStudioJob() {
+  const response = await send({ type: "CLEAR_STUDIO_JOB" });
+  if (!response.ok) {
+    setStatus(response.error, true);
+    return;
+  }
+  showStudioEntry();
+}
+
+async function cancelStudioJob() {
+  const response = await send({ type: "CANCEL_STUDIO_JOB" });
+  if (!response.ok || !("job" in response)) {
+    setStatus(response.ok ? "Could not cancel Studio job." : response.error, true);
+    return;
+  }
+  renderStudioJob(response.job);
+}
+
 async function generateArtifact() {
   clearStatus();
+  const existingJob = await send({ type: "GET_STUDIO_JOB" });
+  if (existingJob.ok && "job" in existingJob && existingJob.job?.status === "running") {
+    renderStudioJob(existingJob.job);
+    return;
+  }
+
   const instructions = el<HTMLTextAreaElement>("studio-instructions").value.trim();
   const baseProfileId = el<HTMLSelectElement>("studio-base-profile").value;
   const baseProfile = baseProfileId ? profiles.find((profile) => profile.id === baseProfileId) ?? null : null;
@@ -503,24 +556,14 @@ async function generateArtifact() {
       baseRun: baseProfile ? await runBaseProfileForRevise(baseProfile) : undefined,
     };
 
-    const result = await streamBackend<{ artifact: ExtractionArtifact }>("/generate-artifact/stream", request);
-    const artifact = extractionArtifactSchema.parse(result.artifact);
-    const candidate = buildProfileFromArtifact(artifact, baseProfile);
-    appendProcessLog("stage", "Running generated profile through the shared preview runner");
-    const preview = await send({ type: "RUN_PROFILE_PREVIEW", profile: candidate });
-    if (!preview.ok || !("scriptInput" in preview)) {
-      throw new Error(preview.ok ? "Generated profile preview failed." : preview.error);
-    }
-    appendArtifact("Script input", preview.scriptInput);
-    appendArtifact("Preview output", preview.output);
-    showEditor(candidate, {
-      source: "studio-candidate",
-      namePlaceholder: artifact.outputDescription || (baseProfile ? `${baseProfile.name} v2` : "Generated profile name"),
+    const response = await send({
+      type: "START_STUDIO_GENERATE",
+      request,
+      tabId: snapshotResponse.tabId,
+      tabUrl: snapshotResponse.url,
     });
-    el("preview-input").textContent = preview.scriptInput;
-    el("preview-output").textContent = preview.output;
-    el<HTMLDetailsElement>("preview-panel").open = true;
-    setStatus(preview.extraction.ok ? "Generated profile preview complete." : "Generated profile has extraction warnings.", !preview.extraction.ok);
+    if (!response.ok || !("job" in response)) throw new Error(response.ok ? "Could not start Studio job." : response.error);
+    renderStudioJob(response.job);
   } catch (error) {
     setStatus(error instanceof Error ? error.message : String(error), true);
     showStudioEntry();
@@ -542,7 +585,7 @@ async function init() {
   el("tab-quickrun").addEventListener("click", () => switchTab("quickrun"));
   el("tab-studio").addEventListener("click", () => {
     switchTab("studio");
-    showStudioEntry();
+    void refreshStudioJob();
   });
   el("btn-back").addEventListener("click", () => {
     showList();
@@ -551,7 +594,10 @@ async function init() {
   el("btn-save").addEventListener("click", () => void saveProfile());
   el("btn-preview").addEventListener("click", () => void previewProfile());
   el("btn-generate").addEventListener("click", () => void generateArtifact());
+  el("btn-cancel-studio").addEventListener("click", () => void cancelStudioJob());
+  el("btn-clear-studio").addEventListener("click", () => void clearStudioJob());
   await load();
+  await refreshStudioJob();
 }
 
 document.addEventListener("DOMContentLoaded", () => void init());

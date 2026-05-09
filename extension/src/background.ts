@@ -1,12 +1,15 @@
 import {
   actionPresetSchema,
   createUrlPattern,
+  extractionArtifactSchema,
   extractionProfileSchema,
   extractionRecipeSchema,
   lastUsedStateSchema,
   matchesUrlPattern,
   scriptConfigSchema,
   type ActionPreset,
+  type CodexProgressEvent,
+  type ExtractionArtifact,
   type ExtractionProfile,
   type ExtractionResult,
 } from "@extractor/shared";
@@ -16,15 +19,22 @@ import type {
   BackgroundResponse,
   ContentRequest,
   ContentResponse,
+  GenerateArtifactResult,
   OffscreenResponse,
   ProfileRunResult,
+  StudioJob,
   ToastVariant,
 } from "./messages.js";
 
 const PROFILES_KEY = "profilesV1";
 const LAST_USED_BY_SITE_KEY = "lastUsedBySiteV1";
+const STUDIO_JOB_KEY = "studioJobV1";
+const BACKEND_URL = "http://localhost:8787";
 const OFFSCREEN_COPY_MESSAGE = "OFFSCREEN_COPY";
 const OFFSCREEN_RUN_SCRIPT_MESSAGE = "OFFSCREEN_RUN_SCRIPT";
+
+let activeStudioAbortController: AbortController | null = null;
+let activeStudioJobId: string | null = null;
 
 async function getActiveTab() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -222,8 +232,7 @@ async function applyAction(content: string, actionPreset: ActionPreset, profile:
   return result;
 }
 
-async function runRecipeOnActiveTab(recipe: unknown) {
-  const tab = await getActiveTab();
+async function runRecipeOnTab(tab: { id: number; url: string }, recipe: unknown) {
   ensureInjectableTab(tab.url);
   const contentResponse = await sendToContent(tab.id, {
     type: "RUN_RECIPE",
@@ -234,13 +243,17 @@ async function runRecipeOnActiveTab(recipe: unknown) {
   return { tab, result: contentResponse.result };
 }
 
+async function runRecipeOnActiveTab(recipe: unknown) {
+  return runRecipeOnTab(await getActiveTab(), recipe);
+}
+
 async function createSnapshotOnActiveTab() {
   const tab = await getActiveTab();
   ensureInjectableTab(tab.url);
   const contentResponse = await sendToContent(tab.id, { type: "CREATE_SNAPSHOT" });
   if (!contentResponse.ok) throw new Error(contentResponse.error);
   if (!("snapshot" in contentResponse)) throw new Error("Snapshot response was incomplete.");
-  return { snapshot: contentResponse.snapshot, url: contentResponse.url };
+  return { snapshot: contentResponse.snapshot, url: contentResponse.url, tabId: tab.id };
 }
 
 function shouldMarkFailed(result: ExtractionResult) {
@@ -278,6 +291,197 @@ async function runProfilePreview(profile: ExtractionProfile) {
   const scriptInput = JSON.stringify(result.data, null, 2);
   const output = await runScript(parsed.script.code, scriptInput);
   return { extraction: result, scriptInput, output };
+}
+
+async function runProfilePreviewOnTab(profile: ExtractionProfile, tab: { id: number; url: string }) {
+  const parsed = extractionProfileSchema.parse(profile);
+  const { result } = await runRecipeOnTab(tab, parsed.recipe);
+  const scriptInput = JSON.stringify(result.data, null, 2);
+  const output = await runScript(parsed.script.code, scriptInput);
+  return { extraction: result, scriptInput, output };
+}
+
+async function getStudioJob(): Promise<StudioJob | null> {
+  const data = await chrome.storage.local.get(STUDIO_JOB_KEY);
+  const raw = data[STUDIO_JOB_KEY];
+  return raw && typeof raw === "object" ? (raw as StudioJob) : null;
+}
+
+async function setStudioJob(job: StudioJob | null) {
+  if (!job) {
+    await chrome.storage.local.remove(STUDIO_JOB_KEY);
+    return;
+  }
+  await chrome.storage.local.set({ [STUDIO_JOB_KEY]: job });
+}
+
+async function updateStudioJob(jobId: string, update: (job: StudioJob) => StudioJob | null) {
+  const current = await getStudioJob();
+  if (!current || current.id !== jobId) return null;
+  const updated = update(current);
+  if (!updated) return current;
+  await setStudioJob({ ...updated, updatedAt: new Date().toISOString() });
+  return updated;
+}
+
+function appendStudioEvent(job: StudioJob, event: CodexProgressEvent): StudioJob {
+  return { ...job, events: [...job.events, event] };
+}
+
+function buildStudioCandidateProfile(artifact: ExtractionArtifact, baseProfile: ExtractionProfile | undefined, urlValue: string) {
+  const now = new Date().toISOString();
+  return extractionProfileSchema.parse({
+    id: `profile-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    name: "Generated candidate",
+    urlPattern: baseProfile?.urlPattern ?? createUrlPattern(urlValue),
+    recipe: artifact.recipe,
+    script: artifact.script,
+    actionPreset: baseProfile?.actionPreset ?? { type: "copy" },
+    status: "ok",
+    createdAt: now,
+    updatedAt: now,
+    version: 1,
+  });
+}
+
+async function streamBackendArtifact(
+  body: unknown,
+  signal: AbortSignal,
+  onEvent: (event: CodexProgressEvent) => Promise<void>,
+): Promise<GenerateArtifactResult> {
+  const response = await fetch(`${BACKEND_URL}/generate-artifact/stream`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+    signal,
+  });
+  if (!response.ok || !response.body) throw new Error(`Backend stream failed: ${response.status}`);
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let doneResult: GenerateArtifactResult | undefined;
+
+  const consumeChunk = async (chunk: string) => {
+    buffer += chunk;
+    const frames = buffer.split(/\n\n/);
+    buffer = frames.pop() ?? "";
+    for (const frame of frames) {
+      const dataLines = frame
+        .split(/\n/)
+        .filter((line) => line.startsWith("data:"))
+        .map((line) => line.slice(5).trimStart());
+      if (dataLines.length === 0) continue;
+      const event = JSON.parse(dataLines.join("\n")) as CodexProgressEvent;
+      await onEvent(event);
+      if (event.type === "error") throw new Error(event.message);
+      if (event.type === "done") doneResult = event.result as GenerateArtifactResult;
+    }
+  };
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    await consumeChunk(decoder.decode(value, { stream: true }));
+  }
+  await consumeChunk(decoder.decode());
+
+  if (doneResult === undefined) throw new Error("Backend stream ended without a final result.");
+  return doneResult;
+}
+
+async function runStudioJob(job: StudioJob, abortController: AbortController) {
+  try {
+    const result = await streamBackendArtifact(job.request, abortController.signal, async (event) => {
+      await updateStudioJob(job.id, (current) => appendStudioEvent(current, event));
+    });
+    if (abortController.signal.aborted) return;
+
+    const artifact = extractionArtifactSchema.parse(result.artifact);
+    const candidateProfile = buildStudioCandidateProfile(artifact, job.request.baseProfile, job.request.url);
+    await updateStudioJob(job.id, (current) =>
+      appendStudioEvent(
+        {
+          ...current,
+          artifact,
+          outputDescription: artifact.outputDescription,
+          candidateProfile,
+        },
+        { type: "stage", message: "Running generated profile through the shared preview runner" },
+      ),
+    );
+
+    const preview = await runProfilePreviewOnTab(candidateProfile, { id: job.tabId, url: job.tabUrl });
+    await updateStudioJob(job.id, (current) => ({
+      ...appendStudioEvent(appendStudioEvent(current, { type: "artifact", artifactType: "result", label: "Script input", content: preview.scriptInput }), {
+        type: "artifact",
+        artifactType: "result",
+        label: "Preview output",
+        content: preview.output,
+      }),
+      status: "done",
+      artifact,
+      outputDescription: artifact.outputDescription,
+      candidateProfile,
+      preview,
+    }));
+  } catch (error) {
+    const isAbort = abortController.signal.aborted || (error instanceof DOMException && error.name === "AbortError");
+    await updateStudioJob(job.id, (current) => {
+      if (current.status === "cancelled" || isAbort) return current;
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        ...appendStudioEvent(current, { type: "error", message }),
+        status: "error",
+        error: message,
+      };
+    });
+  } finally {
+    if (activeStudioJobId === job.id) {
+      activeStudioAbortController = null;
+      activeStudioJobId = null;
+    }
+  }
+}
+
+async function startStudioGenerate(message: Extract<BackgroundRequest, { type: "START_STUDIO_GENERATE" }>) {
+  const existing = await getStudioJob();
+  if (existing?.status === "running") return existing;
+
+  const now = new Date().toISOString();
+  const job: StudioJob = {
+    id: `studio-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    status: "running",
+    request: message.request,
+    tabId: message.tabId,
+    tabUrl: message.tabUrl,
+    events: [{ type: "stage", message: "Starting Codex Studio generation" }],
+    createdAt: now,
+    updatedAt: now,
+  };
+  await setStudioJob(job);
+
+  const abortController = new AbortController();
+  activeStudioAbortController = abortController;
+  activeStudioJobId = job.id;
+  void runStudioJob(job, abortController);
+  return job;
+}
+
+async function cancelStudioJob() {
+  const job = await getStudioJob();
+  if (!job || job.status !== "running") return job;
+  if (activeStudioJobId === job.id) {
+    activeStudioAbortController?.abort();
+  }
+  const updated = {
+    ...appendStudioEvent(job, { type: "error", message: "Cancelled by user", stage: "cancelled" }),
+    status: "cancelled" as const,
+    error: "Cancelled by user",
+    updatedAt: new Date().toISOString(),
+  };
+  await setStudioJob(updated);
+  return updated;
 }
 
 chrome.runtime.onMessage.addListener(
@@ -338,6 +542,31 @@ chrome.runtime.onMessage.addListener(
         if (message.type === "RUN_SCRIPT_PREVIEW") {
           const output = await runScript(message.script.code, message.input);
           sendResponse({ ok: true, output });
+          return;
+        }
+
+        if (message.type === "START_STUDIO_GENERATE") {
+          sendResponse({ ok: true, job: await startStudioGenerate(message) });
+          return;
+        }
+
+        if (message.type === "GET_STUDIO_JOB") {
+          sendResponse({ ok: true, job: await getStudioJob() });
+          return;
+        }
+
+        if (message.type === "CANCEL_STUDIO_JOB") {
+          sendResponse({ ok: true, job: await cancelStudioJob() });
+          return;
+        }
+
+        if (message.type === "CLEAR_STUDIO_JOB") {
+          const job = await getStudioJob();
+          if (job?.status === "running") {
+            await cancelStudioJob();
+          }
+          await setStudioJob(null);
+          sendResponse({ ok: true, job: null });
           return;
         }
 
