@@ -21,7 +21,7 @@ import {
   intentAnalysisOutputSchema,
   transformOutputSchema,
 } from "./llm.js";
-import { buildAnalyzeIntentPrompt, buildGeneratePrompt, buildRefinePrompt, buildRepairPrompt, buildTransformPrompt } from "./prompts.js";
+import { buildAnalyzeIntentPrompt, buildGeneratePrompt, buildRefinePrompt, buildTransformPrompt } from "./prompts.js";
 import { detectRiskyRequest, runTransform, safePreviewExport, validateTransformSpec } from "./transform.js";
 
 const generateRequestSchema = z.object({
@@ -29,19 +29,12 @@ const generateRequestSchema = z.object({
   intent: z.string().min(1),
   domSnapshot: z.string().min(1),
   confirmedFields: z.array(z.string().min(1)).optional(),
+  baseRecipe: extractionRecipeSchema.optional(),
 });
 
 const analyzeIntentRequestSchema = z.object({
   url: z.string().url(),
   domSnapshot: z.string().min(1),
-});
-
-const repairRequestSchema = z.object({
-  url: z.string().url(),
-  intent: z.string().min(1),
-  domSnapshot: z.string().min(1),
-  oldRecipe: extractionRecipeSchema,
-  userNote: z.string().optional(),
 });
 
 const transformRequestSchema = z.object({
@@ -157,29 +150,6 @@ export function createApp() {
       emit({ type: "stage", message: "Validating recipe schema" });
       const recipe = parseRecipe(candidate);
       emit({ type: "artifact", artifactType: "recipe", label: "Recipe JSON", content: recipe });
-      emit({ type: "done", result: { recipe } });
-    });
-  });
-
-  app.post("/repair-recipe", async (req, res) => {
-    try {
-      const input = repairRequestSchema.parse(req.body);
-      const candidate = await generateJsonFromLLM(buildRepairPrompt(input), {});
-      res.json({ recipe: parseRecipe(candidate) });
-    } catch (error) {
-      const status = error instanceof z.ZodError ? 400 : 500;
-      res.status(status).json(serializeError(error));
-    }
-  });
-
-  app.post("/repair-recipe/stream", async (req, res) => {
-    await withSse(res, async (emit) => {
-      emit({ type: "stage", message: "Validating request" });
-      const input = repairRequestSchema.parse(req.body);
-      const candidate = await generateJsonFromLLMStreamed(buildRepairPrompt(input), {}, emit);
-      emit({ type: "stage", message: "Validating recipe schema" });
-      const recipe = parseRecipe(candidate);
-      emit({ type: "artifact", artifactType: "recipe", label: "Repaired recipe JSON", content: recipe });
       emit({ type: "done", result: { recipe } });
     });
   });

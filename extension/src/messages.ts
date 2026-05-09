@@ -59,6 +59,8 @@ export type BackgroundRequest =
       url: string;
       /** Confirmed field names from ANALYZE_INTENT proposal (optional) */
       confirmedFields?: string[];
+      /** Optional saved recipe to use as the starting point for a new config. */
+      baseRecipe?: ExtractionRecipe;
     }
   | { type: "RUN_RECIPE_PREVIEW"; recipe: ExtractionRecipe }
 
@@ -84,15 +86,6 @@ export type BackgroundRequest =
       type: "RUN_TRANSFORM_PREVIEW";
       transform: TransformSpec;
       data: unknown;
-    }
-
-  // ── Codex Studio — Entry C: repair a failed profile ───────────────────
-  | {
-      type: "REPAIR_RECIPE";
-      profileId: string;
-      domSnapshot: string;
-      url: string;
-      userNote?: string;
     }
 
   // ── Profile CRUD ───────────────────────────────────────────────────────

@@ -176,7 +176,7 @@ function escapeHtml(s: string): string {
 
 // ── Wizard state ───────────────────────────────────────────────────────────
 
-type WizardScreen = "entry" | "extracting" | "result" | "save" | "repair";
+type WizardScreen = "entry" | "extracting" | "result" | "save";
 
 type RefineStreamResult = {
   artifact: {
@@ -189,7 +189,6 @@ type RefineStreamResult = {
 
 const SCREEN_TO_STEP: Record<WizardScreen, number> = {
   entry: 0,
-  repair: 0,
   extracting: 1,
   result: 2,
   save: 3,
@@ -204,12 +203,12 @@ const wiz = {
   result: null as ExtractionResult | null,
   transform: null as TransformSpec | null,
   exportResult: null as ExportResult | null,
-  repairProfileId: null as string | null,
+  baseProfileId: null as string | null,
 };
 
 function showScreen(screen: WizardScreen) {
   wiz.screen = screen;
-  const screens: WizardScreen[] = ["entry", "extracting", "result", "save", "repair"];
+  const screens: WizardScreen[] = ["entry", "extracting", "result", "save"];
   screens.forEach((s) => {
     const node = document.getElementById(`cs-${s}`);
     if (node) node.classList.toggle("hidden", s !== screen);
@@ -283,6 +282,7 @@ async function loadProfiles() {
 
   siteProfiles = resp.profiles;
   renderProfileList();
+  renderBaseConfigOptions();
 }
 
 function renderProfileList() {
@@ -323,9 +323,7 @@ function renderProfileList() {
         <div class="profile-card-main">
           <span class="profile-name">${failed ? "Warning: " : ""}${escapeHtml(profile.name)}</span>
           <div class="profile-card-actions">
-            ${failed
-              ? `<button class="btn-repair btn-secondary btn-small" data-id="${escapeHtml(profile.id)}">Repair</button>`
-              : `<button class="btn-run btn-primary btn-small" data-id="${escapeHtml(profile.id)}">Run</button>`}
+            <button class="btn-run btn-primary btn-small" data-id="${escapeHtml(profile.id)}">Run</button>
             <button class="btn-rename btn-ghost btn-small" data-id="${escapeHtml(profile.id)}">Rename</button>
             <button class="btn-delete btn-ghost btn-small btn-danger" data-id="${escapeHtml(profile.id)}">Delete</button>
           </div>
@@ -345,9 +343,6 @@ function renderProfileList() {
 
   list.querySelectorAll<HTMLButtonElement>(".btn-run").forEach((btn) => {
     btn.addEventListener("click", () => void runProfile(btn.dataset.id!));
-  });
-  list.querySelectorAll<HTMLButtonElement>(".btn-repair").forEach((btn) => {
-    btn.addEventListener("click", () => startRepair(btn.dataset.id!));
   });
   list.querySelectorAll<HTMLButtonElement>(".btn-rename").forEach((btn) => {
     btn.addEventListener("click", () => startRenameProfile(btn.dataset.id!));
@@ -372,6 +367,21 @@ function renderProfileList() {
   list.querySelectorAll<HTMLSelectElement>(".profile-action-select").forEach((select) => {
     select.addEventListener("change", () => void saveProfileAction(select.dataset.id!, select.value as ActionPreset["type"]));
   });
+}
+
+function renderBaseConfigOptions() {
+  const select = el<HTMLSelectElement>("cs-base-config");
+  const selected = wiz.baseProfileId;
+  select.innerHTML = [
+    '<option value="">Start from scratch</option>',
+    ...siteProfiles.map((profile) => (
+      `<option value="${escapeHtml(profile.id)}"${profile.id === selected ? " selected" : ""}>${escapeHtml(profile.name)}</option>`
+    )),
+  ].join("");
+  if (selected && !siteProfiles.some((profile) => profile.id === selected)) {
+    wiz.baseProfileId = null;
+    select.value = "";
+  }
 }
 
 function startRenameProfile(profileId: string) {
@@ -515,6 +525,7 @@ async function ensureSnapshot(): Promise<string | null> {
 async function onExtract() {
   clearStatus();
   wiz.intent = el<HTMLTextAreaElement>("cs-intent").value.trim();
+  wiz.baseProfileId = el<HTMLSelectElement>("cs-base-config").value || null;
   await doExtractAndFormat();
 }
 
@@ -528,8 +539,15 @@ async function doExtractAndFormat() {
 
   let intent = wiz.intent;
   let confirmedFields: string[] | undefined;
+  const baseProfile = wiz.baseProfileId ? siteProfiles.find((profile) => profile.id === wiz.baseProfileId) : undefined;
 
-  if (!intent) {
+  if (baseProfile && !intent) {
+    intent = "Update this base configuration for the current page.";
+    wiz.intent = intent;
+    appendProcessLog("stage", `Using "${baseProfile.name}" as the base configuration`);
+  } else if (baseProfile) {
+    appendProcessLog("stage", `Using "${baseProfile.name}" as the base configuration`);
+  } else if (!intent) {
     const ar = await send({ type: "ANALYZE_INTENT", domSnapshot: snapshot, url: wiz.url });
     if (!ar.ok || !("analysis" in ar)) {
       setStatus(ar.ok ? "Analysis failed" : ar.error, true);
@@ -545,10 +563,11 @@ async function doExtractAndFormat() {
   let gr: { recipe: ExtractionRecipe };
   try {
     gr = await streamBackend<{ recipe: ExtractionRecipe }>("/generate-recipe/stream", {
-    intent,
-    domSnapshot: snapshot,
-    url: wiz.url,
-    confirmedFields,
+      intent,
+      domSnapshot: snapshot,
+      url: wiz.url,
+      confirmedFields,
+      baseRecipe: baseProfile?.recipe,
     });
   } catch (error) {
     setStatus(error instanceof Error ? error.message : String(error), true);
@@ -579,9 +598,9 @@ async function applyAutoFormat(hint = "") {
   const outputRequest = hint || "auto";
   try {
     const fr = await streamBackend<{ transform: TransformSpec | null; exportResult: ExportResult }>("/transform/stream", {
-    outputRequest,
-    intent: wiz.intent || "Extract the main content",
-    result: wiz.result,
+      outputRequest,
+      intent: wiz.intent || "Extract the main content",
+      result: wiz.result,
     });
     wiz.transform = fr.transform;
     wiz.exportResult = fr.exportResult;
@@ -666,70 +685,6 @@ async function onRefine() {
   setBtnLoading("btn-refine", false);
 }
 
-// ── Codex Studio: Repair ──────────────────────────────────────────────────
-
-function startRepair(profileId: string) {
-  const profile = siteProfiles.find((p) => p.id === profileId);
-  if (!profile) return;
-  wiz.repairProfileId = profileId;
-  wiz.intent = profile.intent;
-  el("cs-repair-name").textContent = profile.name;
-  el("cs-repair-reason").textContent = "Last run returned empty or failed results.";
-  el<HTMLTextAreaElement>("cs-repair-note").value = "";
-  switchTab("codex");
-  showScreen("repair");
-}
-
-async function onStartRepair() {
-  clearStatus();
-  if (!wiz.repairProfileId) return;
-  const userNote = el<HTMLTextAreaElement>("cs-repair-note").value.trim() || undefined;
-  showScreen("extracting");
-  resetProcessView("Preparing repair");
-
-  const snapshot = await ensureSnapshot();
-  if (!snapshot) { showScreen("repair"); return; }
-
-  const profile = siteProfiles.find((p) => p.id === wiz.repairProfileId);
-  if (!profile) {
-    setStatus("Profile not found.", true);
-    showScreen("repair");
-    return;
-  }
-
-  let resp: { recipe: ExtractionRecipe };
-  try {
-    resp = await streamBackend<{ recipe: ExtractionRecipe }>("/repair-recipe/stream", {
-      url: wiz.url,
-      intent: profile.intent,
-      domSnapshot: snapshot,
-      oldRecipe: profile.recipe,
-      userNote,
-    });
-  } catch (error) {
-    setStatus(error instanceof Error ? error.message : String(error), true);
-    showScreen("repair");
-    return;
-  }
-
-  wiz.recipe = resp.recipe;
-  appendProcessLog("stage", "Running repaired recipe in current page");
-  const run = await send({ type: "RUN_RECIPE_PREVIEW", recipe: resp.recipe });
-  if (!run.ok || !("result" in run)) {
-    const message = run.ok ? "Recipe run failed" : run.error;
-    appendProcessLog("error", message, true);
-    setStatus(message, true);
-    showScreen("repair");
-    return;
-  }
-  wiz.result = run.result;
-  appendProcessArtifact("Extraction result", wiz.result.data);
-
-  await applyAutoFormat();
-  renderResult();
-  showScreen("result");
-}
-
 // ── Codex Studio: Save ────────────────────────────────────────────────────
 
 function generateId(): string {
@@ -744,37 +699,36 @@ async function onSaveConfig() {
   if (!name) { setStatus("Please enter a configuration name.", true); return; }
 
   const now = new Date().toISOString();
-  const isRepair = !!wiz.repairProfileId;
-  const existing = isRepair ? siteProfiles.find((p) => p.id === wiz.repairProfileId) : undefined;
+  const baseProfile = wiz.baseProfileId ? siteProfiles.find((p) => p.id === wiz.baseProfileId) : undefined;
 
   const profile: ExtractionProfile = {
-    id: wiz.repairProfileId ?? generateId(),
+    id: generateId(),
     name,
-    urlPattern: existing?.urlPattern ?? createUrlPattern(wiz.url),
+    urlPattern: baseProfile?.urlPattern ?? createUrlPattern(wiz.url),
     intent: wiz.intent || "Extract the main content",
     recipe: wiz.recipe,
     transform: wiz.transform ?? undefined,
     outputDescription: wiz.exportResult?.formatLabel,
-    actionPreset: existing?.actionPreset ?? { type: "copy" },
-    isDefault: existing?.isDefault ?? false,
+    actionPreset: baseProfile?.actionPreset ?? { type: "copy" },
+    isDefault: false,
     status: "ok",
     lastRunAt: now,
-    createdAt: existing?.createdAt ?? now,
+    createdAt: now,
     updatedAt: now,
-    version: (existing?.version ?? 0) + 1,
+    version: 1,
   };
 
   const resp = await send({ type: "SAVE_PROFILE", profile });
   if (!resp.ok) { setStatus(resp.error, true); return; }
 
-  setStatus(isRepair ? "Configuration repaired and saved." : "Configuration saved.");
+  setStatus("Configuration saved.");
   resetWizard();
   switchTab("quickrun");
   await loadProfiles();
 }
 
 function resetWizard() {
-  wiz.repairProfileId = null;
+  wiz.baseProfileId = null;
   wiz.snapshot = "";
   wiz.recipe = null;
   wiz.result = null;
@@ -782,6 +736,7 @@ function resetWizard() {
   wiz.exportResult = null;
   wiz.intent = "";
   el<HTMLTextAreaElement>("cs-intent").value = "";
+  el<HTMLSelectElement>("cs-base-config").value = "";
   showScreen("entry");
 }
 
@@ -804,7 +759,10 @@ async function init() {
 
   el("tab-codex").addEventListener("click", () => switchTab("codex"));
   el("tab-quickrun").addEventListener("click", () => switchTab("quickrun"));
-  el("btn-new-config").addEventListener("click", () => { switchTab("codex"); showScreen("entry"); });
+  el("btn-new-config").addEventListener("click", () => { resetWizard(); switchTab("codex"); });
+  el("cs-base-config").addEventListener("change", () => {
+    wiz.baseProfileId = el<HTMLSelectElement>("cs-base-config").value || null;
+  });
 
   el("btn-extract").addEventListener("click", () => void onExtract());
   el("btn-start-over").addEventListener("click", () => resetWizard());
@@ -817,9 +775,6 @@ async function init() {
 
   el("btn-save-back").addEventListener("click", () => showScreen("result"));
   el("btn-save-config").addEventListener("click", () => void onSaveConfig());
-
-  el("btn-repair-back").addEventListener("click", () => { wiz.repairProfileId = null; switchTab("quickrun"); });
-  el("btn-repair-start").addEventListener("click", () => void onStartRepair());
 }
 
 document.addEventListener("DOMContentLoaded", () => void init());

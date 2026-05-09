@@ -25,13 +25,6 @@ const validRecipe = {
   fields: [{ name: "title", selector: "h1", value: "textContent", required: true }],
 };
 
-const validDebug = {
-  mode: "single",
-  rootMatchCount: 1,
-  fields: [{ name: "title", selector: "h1", matchCount: 0, emptyCount: 0 }],
-  errors: [{ code: "required_empty", field: "title", message: "Missing title" }],
-};
-
 describe("backend app with Codex provider", () => {
   beforeEach(() => {
     mockedGenerateJson.mockReset();
@@ -82,27 +75,26 @@ describe("backend app with Codex provider", () => {
     expect(response.text).toContain('"recipe"');
   });
 
-  it("repairs a recipe through Codex", async () => {
-    const repairedRecipe = {
+  it("generates a recipe from a base recipe through Codex", async () => {
+    const adjustedRecipe = {
       version: 1,
       mode: "single",
       fields: [{ name: "title", selector: ".headline", value: "textContent", required: true }],
     };
-    mockedGenerateJson.mockResolvedValue(repairedRecipe);
+    mockedGenerateJson.mockResolvedValue(adjustedRecipe);
 
     const response = await request(createApp())
-      .post("/repair-recipe")
+      .post("/generate-recipe")
       .send({
         url: "https://example.com/page",
-        intent: "Extract title",
+        intent: "Use the new headline class",
         domSnapshot: '<h1 class="headline">Hello</h1>',
-        oldRecipe: validRecipe,
-        debug: validDebug,
-        failureReason: "Missing title",
+        baseRecipe: validRecipe,
       })
       .expect(200);
 
-    expect(response.body.recipe).toEqual(repairedRecipe);
+    expect(response.body.recipe).toEqual(adjustedRecipe);
+    expect(mockedGenerateJson).toHaveBeenCalledTimes(1);
   });
 
   it("rejects Codex recipes with arbitrary code fields", async () => {
