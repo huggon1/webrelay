@@ -1,19 +1,16 @@
 import { createDomSnapshot, executeRecipe, extractionRecipeSchema } from "@extractor/shared";
 import type { ContentRequest, ContentResponse, ToastVariant } from "./messages.js";
 
-// ── Toast ──────────────────────────────────────────────────────────────────
-
 function showToast(message: string, variant: ToastVariant) {
   const existing = document.getElementById("webrelay-toast");
   if (existing) existing.remove();
 
   const toast = document.createElement("div");
   toast.id = "webrelay-toast";
-
   const bg: Record<ToastVariant, string> = {
-    success: "#2ea44f",
-    error: "#cf222e",
-    info: "#1f6feb",
+    success: "#227d4d",
+    error: "#c7353a",
+    info: "#2463c7",
   };
 
   Object.assign(toast.style, {
@@ -21,32 +18,28 @@ function showToast(message: string, variant: ToastVariant) {
     bottom: "20px",
     right: "20px",
     zIndex: "2147483647",
-    maxWidth: "340px",
+    maxWidth: "360px",
     padding: "10px 14px",
-    borderRadius: "8px",
+    borderRadius: "6px",
     background: bg[variant],
     color: "#fff",
     fontFamily: "Inter, ui-sans-serif, system-ui, sans-serif",
     fontSize: "13px",
     fontWeight: "600",
     lineHeight: "1.4",
-    boxShadow: "0 4px 12px rgba(0,0,0,0.2)",
-    transition: "opacity 0.3s ease",
+    boxShadow: "0 8px 24px rgba(0,0,0,0.24)",
     opacity: "1",
     pointerEvents: "none",
+    transition: "opacity 0.2s ease",
   });
-
   toast.textContent = message;
   document.body.appendChild(toast);
 
-  const hide = () => {
+  window.setTimeout(() => {
     toast.style.opacity = "0";
-    setTimeout(() => toast.remove(), 350);
-  };
-  setTimeout(hide, 3000);
+    window.setTimeout(() => toast.remove(), 250);
+  }, 3000);
 }
-
-// ── Message handler ────────────────────────────────────────────────────────
 
 chrome.runtime.onMessage.addListener(
   (message: ContentRequest, _sender, sendResponse: (response: ContentResponse) => void) => {

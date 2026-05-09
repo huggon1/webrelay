@@ -30,18 +30,18 @@ await Promise.all([
   }),
   esbuild.build({
     ...common,
-    entryPoints: ["src/sandbox.ts"],
-    outfile: "dist/sandbox.js",
+    entryPoints: ["src/offscreen.ts"],
+    outfile: "dist/offscreen.js",
   }),
   esbuild.build({
     ...common,
-    entryPoints: ["src/offscreen.ts"],
-    outfile: "dist/offscreen.js",
+    entryPoints: ["src/sandbox.ts"],
+    outfile: "dist/sandbox.js",
   }),
 ]);
 
 await cp("manifest.json", "dist/manifest.json");
 await cp("src/popup.html", "dist/popup.html");
 await cp("src/popup.css", "dist/popup.css");
-await cp("src/sandbox.html", "dist/sandbox.html");
 await cp("src/offscreen.html", "dist/offscreen.html");
+await cp("src/sandbox.html", "dist/sandbox.html");

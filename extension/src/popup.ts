@@ -1,101 +1,400 @@
 import {
+  actionPresetSchema,
   createUrlPattern,
-  exportResultSchema,
+  extractionArtifactSchema,
+  extractionProfileSchema,
+  extractionRecipeSchema,
+  matchesUrlPattern,
   type ActionPreset,
   type CodexProgressEvent,
-  type ExportResult,
+  type ExtractionArtifact,
   type ExtractionProfile,
-  type ExtractionRecipe,
-  type ExtractionResult,
-  type TransformSpec,
 } from "@extractor/shared";
-import type {
-  ActionRunResult,
-  BackgroundRequest,
-  BackgroundResponse,
-} from "./messages.js";
+import type { BackgroundRequest, BackgroundResponse, GenerateArtifactRequest } from "./messages.js";
+import { selectGenerateMode } from "./studio-mode.js";
 
 const BACKEND_URL = "http://localhost:8787";
 
-// ── Messaging ──────────────────────────────────────────────────────────────
+const sampleRecipe = {
+  version: 1,
+  mode: "list",
+  rootSelector: ".chat-message",
+  fields: [
+    { name: "role", value: "attribute", attribute: "data-role", required: true },
+    { name: "time", selector: ".message-time", value: "textContent", required: true },
+    { name: "text", selector: ".message-text", value: "textContent", required: true },
+  ],
+};
 
-async function send(msg: BackgroundRequest): Promise<BackgroundResponse> {
-  return chrome.runtime.sendMessage(msg);
-}
+const sampleScript = String.raw`const messages = JSON.parse(input);
+return messages
+  .map((m) => \`### \${m.role} \${m.time ? \`(\${m.time})\` : ""}\n\n\${m.text}\`)
+  .join("\n\n---\n\n");`;
 
-// ── DOM helpers ────────────────────────────────────────────────────────────
+let currentUrl = "";
+let profiles: ExtractionProfile[] = [];
+let editingProfile: ExtractionProfile | null = null;
+let editorSource: "manual-new" | "manual-edit" | "studio-candidate" = "manual-new";
+let listScope: "current" | "all" = "current";
 
 function el<T extends HTMLElement>(id: string): T {
-  const found = document.getElementById(id);
-  if (!found) throw new Error(`#${id} not found`);
-  return found as T;
+  const node = document.getElementById(id);
+  if (!node) throw new Error(`#${id} not found`);
+  return node as T;
 }
 
-function setStatus(msg: string, isError = false) {
+async function send(message: BackgroundRequest): Promise<BackgroundResponse> {
+  return chrome.runtime.sendMessage(message);
+}
+
+function switchTab(tab: "quickrun" | "studio") {
+  const isQuickRun = tab === "quickrun";
+  el("panel-quickrun").classList.toggle("hidden", !isQuickRun);
+  el("panel-studio").classList.toggle("hidden", isQuickRun);
+  el("screen-edit").classList.add("hidden");
+  el("tab-quickrun").classList.toggle("active", isQuickRun);
+  el("tab-studio").classList.toggle("active", !isQuickRun);
+  clearStatus();
+}
+
+function setStatus(message: string, isError = false) {
   const bar = el("status-bar");
-  bar.textContent = msg;
+  bar.textContent = message;
   bar.className = `status-bar${isError ? " status-bar--error" : ""}`;
 }
 
 function clearStatus() {
-  const bar = el("status-bar");
-  bar.textContent = "";
-  bar.className = "status-bar";
+  setStatus("");
 }
 
-function setBtnLoading(id: string, loading: boolean) {
-  const btn = el<HTMLButtonElement>(id);
-  btn.disabled = loading;
+function setLoading(id: string, loading: boolean) {
+  const button = el<HTMLButtonElement>(id);
+  button.disabled = loading;
   if (loading) {
-    btn.dataset.originalText = btn.textContent ?? "";
-    btn.textContent = "Processing...";
+    button.dataset.originalText = button.textContent ?? "";
+    button.textContent = "Working...";
   } else {
-    btn.textContent = btn.dataset.originalText ?? "";
+    button.textContent = button.dataset.originalText ?? button.textContent;
   }
 }
 
-function setProcessStage(message: string) {
-  el("cs-process-stage").textContent = message;
+function escapeHtml(value: string) {
+  return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 
-function resetProcessView(initialStage = "Preparing...") {
-  setProcessStage(initialStage);
-  el("cs-process-log").innerHTML = "";
-  el("cs-process-artifacts").innerHTML = "";
+function formatTimeAgo(iso?: string) {
+  if (!iso) return "Never";
+  const diff = Date.now() - new Date(iso).getTime();
+  const mins = Math.floor(diff / 60000);
+  if (mins < 1) return "Just now";
+  if (mins < 60) return `${mins}m ago`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return `${hrs}h ago`;
+  return `${Math.floor(hrs / 24)}d ago`;
+}
+
+function actionOptions(selected: ActionPreset["type"]) {
+  const options: { value: ActionPreset["type"]; label: string }[] = [
+    { value: "copy", label: "Copy" },
+    { value: "download", label: "Download" },
+    { value: "copy_download", label: "Copy + Download" },
+  ];
+  return options
+    .map((option) => `<option value="${option.value}"${option.value === selected ? " selected" : ""}>${option.label}</option>`)
+    .join("");
+}
+
+function showList() {
+  el("panel-quickrun").classList.remove("hidden");
+  el("panel-studio").classList.add("hidden");
+  el("screen-list").classList.remove("hidden");
+  el("screen-edit").classList.add("hidden");
+  el("tab-quickrun").classList.add("active");
+  el("tab-studio").classList.remove("active");
+  editingProfile = null;
+  editorSource = "manual-new";
+}
+
+function showEditor(
+  profile: ExtractionProfile | null,
+  options: { source?: "manual-new" | "manual-edit" | "studio-candidate"; namePlaceholder?: string } = {},
+) {
+  editingProfile = profile;
+  editorSource = options.source ?? (profile ? "manual-edit" : "manual-new");
+  el("panel-quickrun").classList.add("hidden");
+  el("panel-studio").classList.add("hidden");
+  el("screen-list").classList.add("hidden");
+  el("screen-edit").classList.remove("hidden");
+  el("editor-title").textContent = editorSource === "manual-edit" ? "Edit Profile" : "New Profile";
+  const nameInput = el<HTMLInputElement>("profile-name");
+  nameInput.value = editorSource === "manual-edit" ? profile?.name ?? "" : "";
+  nameInput.placeholder = options.namePlaceholder ?? (editorSource === "manual-edit" ? "Profile name" : "Chat to Markdown");
+  el<HTMLInputElement>("profile-url-pattern").value = profile?.urlPattern ?? createUrlPattern(currentUrl);
+  el<HTMLSelectElement>("profile-action").value = profile?.actionPreset.type ?? "copy";
+  el<HTMLTextAreaElement>("profile-recipe").value = JSON.stringify(profile?.recipe ?? sampleRecipe, null, 2);
+  el<HTMLTextAreaElement>("profile-script").value = profile?.script.code ?? sampleScript;
+  el("preview-input").textContent = "";
+  el("preview-output").textContent = "";
+  el<HTMLDetailsElement>("preview-panel").open = false;
+  clearStatus();
+}
+
+function renderProfiles() {
+  const list = el("profile-list");
+  list.innerHTML = "";
+
+  if (profiles.length === 0) {
+    list.innerHTML = `<p class="empty">${listScope === "current" ? "No profiles for this page yet." : "No saved profiles yet."}</p>`;
+    return;
+  }
+
+  for (const profile of profiles) {
+    const matchesCurrentUrl = matchesUrlPattern(profile.urlPattern, currentUrl);
+    const card = document.createElement("article");
+    card.className = `profile-card${profile.status === "possibly_failed" ? " profile-card--failed" : ""}`;
+    card.innerHTML = `
+      <div class="profile-main">
+        <span class="profile-title">${profile.status === "possibly_failed" ? "Warning: " : ""}${escapeHtml(profile.name)}</span>
+        <div class="profile-actions">
+          <button class="btn-primary btn-small" data-run="${escapeHtml(profile.id)}"${matchesCurrentUrl ? "" : " disabled"}>${matchesCurrentUrl ? "Run" : "No match"}</button>
+          <button class="btn-ghost btn-small" data-edit="${escapeHtml(profile.id)}">Edit</button>
+          <button class="btn-ghost btn-small btn-danger" data-delete="${escapeHtml(profile.id)}">Delete</button>
+        </div>
+      </div>
+      <div class="profile-meta">
+        <select class="profile-action-select" data-action="${escapeHtml(profile.id)}">${actionOptions(profile.actionPreset.type)}</select>
+        <span>Last run: ${formatTimeAgo(profile.lastRunAt)}</span>
+        <span class="profile-pattern" title="${escapeHtml(profile.urlPattern)}">${escapeHtml(profile.urlPattern)}</span>
+      </div>
+    `;
+    list.appendChild(card);
+  }
+
+  list.querySelectorAll<HTMLButtonElement>("[data-run]").forEach((button) => {
+    button.addEventListener("click", () => void runProfile(button.dataset.run!));
+  });
+  list.querySelectorAll<HTMLButtonElement>("[data-edit]").forEach((button) => {
+    const profile = profiles.find((candidate) => candidate.id === button.dataset.edit);
+    if (profile) button.addEventListener("click", () => showEditor(profile, { source: "manual-edit" }));
+  });
+  list.querySelectorAll<HTMLButtonElement>("[data-delete]").forEach((button) => {
+    button.addEventListener("click", () => void deleteProfile(button.dataset.delete!));
+  });
+  list.querySelectorAll<HTMLSelectElement>("[data-action]").forEach((select) => {
+    select.addEventListener("change", () => void updateProfileAction(select.dataset.action!, select.value as ActionPreset["type"]));
+  });
+}
+
+async function load() {
+  const tabResponse = await send({ type: "GET_ACTIVE_TAB" });
+  if (!tabResponse.ok || !("tab" in tabResponse)) {
+    setStatus(tabResponse.ok ? "No active tab." : tabResponse.error, true);
+    return;
+  }
+  currentUrl = tabResponse.tab.url;
+  const url = new URL(currentUrl);
+  el("current-url").textContent = url.protocol === "file:" ? "local file" : url.hostname;
+
+  el("scope-current").classList.toggle("active", listScope === "current");
+  el("scope-all").classList.toggle("active", listScope === "all");
+
+  const profilesResponse =
+    listScope === "current"
+      ? await send({ type: "LIST_PROFILES_FOR_SITE", url: currentUrl })
+      : await send({ type: "LIST_ALL_PROFILES" });
+  if (!profilesResponse.ok || !("profiles" in profilesResponse)) {
+    setStatus(profilesResponse.ok ? "Could not load profiles." : profilesResponse.error, true);
+    return;
+  }
+  profiles = profilesResponse.profiles;
+  renderProfiles();
+  renderStudioProfileOptions();
+}
+
+function renderStudioProfileOptions() {
+  const select = el<HTMLSelectElement>("studio-base-profile");
+  const selected = select.value;
+  select.innerHTML = '<option value="">None - create a new profile</option>';
+  for (const profile of profiles) {
+    const option = document.createElement("option");
+    option.value = profile.id;
+    option.textContent = profile.name;
+    select.append(option);
+  }
+  select.value = profiles.some((profile) => profile.id === selected) ? selected : "";
+}
+
+function buildProfileFromForm(): ExtractionProfile {
+  const now = new Date().toISOString();
+  const recipeText = el<HTMLTextAreaElement>("profile-recipe").value;
+  let recipeJson: unknown;
+  try {
+    recipeJson = JSON.parse(recipeText);
+  } catch (error) {
+    throw new Error(`Recipe JSON is invalid: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
+  const name = el<HTMLInputElement>("profile-name").value.trim();
+  if (!name) throw new Error("Name is required.");
+  const urlPattern = el<HTMLInputElement>("profile-url-pattern").value.trim();
+  if (!urlPattern) throw new Error("URL pattern is required.");
+  const actionPreset = actionPresetSchema.parse({ type: el<HTMLSelectElement>("profile-action").value });
+  const recipe = extractionRecipeSchema.parse(recipeJson);
+  const code = el<HTMLTextAreaElement>("profile-script").value.trim();
+  if (!code) throw new Error("JS transform body is required.");
+
+  return extractionProfileSchema.parse({
+    id: editorSource === "manual-edit" && editingProfile ? editingProfile.id : `profile-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    name,
+    urlPattern,
+    recipe,
+    script: { version: 1, code },
+    actionPreset,
+    status: editingProfile?.status ?? "ok",
+    lastRunAt: editingProfile?.lastRunAt,
+    createdAt: editorSource === "manual-edit" && editingProfile ? editingProfile.createdAt : now,
+    updatedAt: now,
+    version: editorSource === "manual-edit" && editingProfile ? editingProfile.version + 1 : 1,
+  });
+}
+
+async function saveProfile() {
+  clearStatus();
+  setLoading("btn-save", true);
+  try {
+    const profile = buildProfileFromForm();
+    const response = await send({ type: "SAVE_PROFILE", profile });
+    if (!response.ok) throw new Error(response.error);
+    setStatus("Profile saved.");
+    showList();
+    await load();
+  } catch (error) {
+    setStatus(error instanceof Error ? error.message : String(error), true);
+  } finally {
+    setLoading("btn-save", false);
+  }
+}
+
+async function previewProfile() {
+  clearStatus();
+  setLoading("btn-preview", true);
+  try {
+    const profile = buildProfileFromForm();
+    const response = await send({ type: "RUN_PROFILE_PREVIEW", profile });
+    if (!response.ok) throw new Error(response.error);
+    if (!("scriptInput" in response) || !("extraction" in response)) throw new Error("Preview failed.");
+    el("preview-input").textContent = response.scriptInput;
+    el("preview-output").textContent = response.output;
+    el<HTMLDetailsElement>("preview-panel").open = true;
+    setStatus(response.extraction.ok ? "Preview complete." : "Preview returned extraction warnings.", !response.extraction.ok);
+  } catch (error) {
+    setStatus(error instanceof Error ? error.message : String(error), true);
+  } finally {
+    setLoading("btn-preview", false);
+  }
+}
+
+async function runProfile(profileId: string) {
+  clearStatus();
+  const select = document.querySelector<HTMLSelectElement>(`.profile-action-select[data-action="${CSS.escape(profileId)}"]`);
+  const actionPresetOverride = select ? { type: select.value as ActionPreset["type"] } : undefined;
+  try {
+    const response = await send({ type: "RUN_PROFILE", profileId, actionPresetOverride });
+    if (!response.ok || !("run" in response)) throw new Error(response.ok ? "Run failed." : response.error);
+    const errors = response.run.actionResult.errors;
+    if (errors.length > 0) {
+      setStatus(errors[0], true);
+      return;
+    }
+    const parts = ([response.run.actionResult.copied && "Copied", response.run.actionResult.downloaded && "Downloaded"] as (string | false)[])
+      .filter(Boolean)
+      .join(" / ");
+    setStatus(parts || "Done");
+    await load();
+  } catch (error) {
+    setStatus(error instanceof Error ? error.message : String(error), true);
+  }
+}
+
+async function updateProfileAction(profileId: string, actionType: ActionPreset["type"]) {
+  const actionPreset = actionPresetSchema.parse({ type: actionType });
+  const response = await send({
+    type: "UPDATE_PROFILE",
+    profileId,
+    updates: { actionPreset, updatedAt: new Date().toISOString() },
+  });
+  if (!response.ok) {
+    setStatus(response.error, true);
+    return;
+  }
+  setStatus("Action updated.");
+  await load();
+}
+
+async function deleteProfile(profileId: string) {
+  const profile = profiles.find((candidate) => candidate.id === profileId);
+  if (!profile) return;
+  if (!window.confirm(`Delete "${profile.name}"?`)) return;
+  const response = await send({ type: "DELETE_PROFILE", profileId });
+  if (!response.ok) {
+    setStatus(response.error, true);
+    return;
+  }
+  setStatus("Profile deleted.");
+  await load();
+}
+
+function showStudioEntry() {
+  el("studio-entry").classList.remove("hidden");
+  el("studio-generating").classList.add("hidden");
+  clearStudioProcess();
+}
+
+function showStudioGenerating(initialStage: string) {
+  el("studio-entry").classList.add("hidden");
+  el("studio-generating").classList.remove("hidden");
+  clearStudioProcess();
+  setStudioStage(initialStage);
+}
+
+function setStudioStage(message: string) {
+  el("studio-stage").textContent = message;
+}
+
+function clearStudioProcess() {
+  el("studio-log").innerHTML = "";
+  el("studio-artifacts").innerHTML = "";
 }
 
 function appendProcessLog(kind: string, message: string, isError = false) {
   const row = document.createElement("div");
-  row.className = `process-event${isError ? " process-event--error" : ""}`;
+  row.className = `process-event${isError ? " process-error" : ""}`;
   row.innerHTML = `
-    <span class="process-event-kind">${escapeHtml(kind)}</span>
-    <span class="process-event-message">${escapeHtml(message)}</span>
+    <span class="process-kind">${escapeHtml(kind)}</span>
+    <span class="process-message">${escapeHtml(message)}</span>
   `;
-  const log = el("cs-process-log");
-  log.appendChild(row);
+  const log = el("studio-log");
+  log.append(row);
   log.scrollTop = log.scrollHeight;
 }
 
-function appendProcessArtifact(label: string, content: unknown) {
+function appendArtifact(label: string, content: unknown) {
   const details = document.createElement("details");
-  details.className = "process-artifact";
+  details.className = "artifact-box";
   details.open = true;
   const text = typeof content === "string" ? content : JSON.stringify(content, null, 2);
-  details.innerHTML = `
-    <summary>${escapeHtml(label)}</summary>
-    <pre>${escapeHtml(text)}</pre>
-  `;
-  el("cs-process-artifacts").appendChild(details);
+  details.innerHTML = `<summary>${escapeHtml(label)}</summary><pre>${escapeHtml(text)}</pre>`;
+  el("studio-artifacts").append(details);
 }
 
 function handleProgressEvent(event: CodexProgressEvent) {
   if (event.type === "stage") {
-    setProcessStage(event.message);
+    setStudioStage(event.message);
     appendProcessLog("stage", event.message);
   } else if (event.type === "reasoning") {
     appendProcessLog("reason", event.message);
   } else if (event.type === "artifact") {
-    appendProcessArtifact(event.label, event.content);
+    appendArtifact(event.label, event.content);
   } else if (event.type === "usage") {
     appendProcessLog("usage", `${event.usage.input_tokens} in / ${event.usage.output_tokens} out`);
   } else if (event.type === "error") {
@@ -109,9 +408,7 @@ async function streamBackend<T>(path: string, body: unknown): Promise<T> {
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
   });
-  if (!response.ok || !response.body) {
-    throw new Error(`Backend stream failed: ${response.status}`);
-  }
+  if (!response.ok || !response.body) throw new Error(`Backend stream failed: ${response.status}`);
 
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
@@ -142,684 +439,119 @@ async function streamBackend<T>(path: string, body: unknown): Promise<T> {
   }
   consumeChunk(decoder.decode());
 
-  if (doneResult === undefined) {
-    throw new Error("Backend stream ended without a final result.");
-  }
+  if (doneResult === undefined) throw new Error("Backend stream ended without a final result.");
   return doneResult;
 }
 
-function formatTimeAgo(iso?: string): string {
-  if (!iso) return "Never";
-  const diff = Date.now() - new Date(iso).getTime();
-  const mins = Math.floor(diff / 60000);
-  if (mins < 1) return "Just now";
-  if (mins < 60) return `${mins}m ago`;
-  const hrs = Math.floor(mins / 60);
-  if (hrs < 24) return `${hrs}h ago`;
-  return `${Math.floor(hrs / 24)}d ago`;
-}
-
-function actionOptions(selected: ActionPreset["type"]) {
-  const options: { value: ActionPreset["type"]; label: string }[] = [
-    { value: "copy", label: "Copy" },
-    { value: "download", label: "Download" },
-    { value: "copy_download", label: "Copy + Download" },
-  ];
-  return options
-    .map((option) => `<option value="${option.value}"${option.value === selected ? " selected" : ""}>${option.label}</option>`)
-    .join("");
-}
-
-function escapeHtml(s: string): string {
-  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
-}
-
-// ── Wizard state ───────────────────────────────────────────────────────────
-
-type WizardScreen = "entry" | "extracting" | "result" | "save" | "repair";
-
-type RefineStreamResult = {
-  artifact: {
-    recipe: ExtractionRecipe;
-    transform?: TransformSpec;
-    outputDescription?: string;
-  };
-  exportResult?: ExportResult;
-};
-
-const SCREEN_TO_STEP: Record<WizardScreen, number> = {
-  entry: 0,
-  repair: 0,
-  extracting: 1,
-  result: 2,
-  save: 3,
-};
-
-const wiz = {
-  screen: "entry" as WizardScreen,
-  snapshot: "",
-  url: "",
-  intent: "",
-  recipe: null as ExtractionRecipe | null,
-  result: null as ExtractionResult | null,
-  transform: null as TransformSpec | null,
-  exportResult: null as ExportResult | null,
-  repairProfileId: null as string | null,
-};
-
-function showScreen(screen: WizardScreen) {
-  wiz.screen = screen;
-  const screens: WizardScreen[] = ["entry", "extracting", "result", "save", "repair"];
-  screens.forEach((s) => {
-    const node = document.getElementById(`cs-${s}`);
-    if (node) node.classList.toggle("hidden", s !== screen);
-  });
-  updateStepIndicator(SCREEN_TO_STEP[screen]);
-  el("btn-start-over").classList.toggle("hidden", screen === "entry");
-}
-
-function updateStepIndicator(activeStep: number) {
-  const indicator = el("step-indicator");
-  if (activeStep === 0) {
-    indicator.classList.add("hidden");
-    return;
-  }
-  indicator.classList.remove("hidden");
-  indicator.querySelectorAll<HTMLElement>(".step-dot").forEach((dot, i) => {
-    const step = i + 1;
-    dot.classList.remove("step-dot--active", "step-dot--done");
-    if (step < activeStep) dot.classList.add("step-dot--done");
-    else if (step === activeStep) dot.classList.add("step-dot--active");
-  });
-}
-
-// ── Transform sandbox ─────────────────────────────────────────────────────
-
-function getSandboxFrame(): HTMLIFrameElement {
-  return document.getElementById("transform-sandbox") as HTMLIFrameElement;
-}
-
-async function runTransformInSandbox(transform: TransformSpec, data: unknown): Promise<ExportResult> {
-  const frame = getSandboxFrame();
-  const id = crypto.randomUUID();
-  return new Promise<ExportResult>((resolve, reject) => {
-    const timeout = window.setTimeout(() => {
-      window.removeEventListener("message", onMessage);
-      reject(new Error("Transform sandbox timed out."));
-    }, 3000);
-    function onMessage(event: MessageEvent) {
-      if (event.source !== frame.contentWindow || (event.data as { id?: string } | null)?.id !== id) return;
-      window.clearTimeout(timeout);
-      window.removeEventListener("message", onMessage);
-      const msg = event.data as { id: string; ok: boolean; exportResult?: unknown; error?: string };
-      if (msg.ok) {
-        resolve(exportResultSchema.parse(msg.exportResult));
-        return;
-      }
-      reject(new Error(msg.error || "Transform sandbox failed."));
-    }
-    window.addEventListener("message", onMessage);
-    frame.contentWindow?.postMessage({ id, type: "RUN_TRANSFORM", transform, data }, "*");
-  });
-}
-
-// ── Quick Run ──────────────────────────────────────────────────────────────
-
-let siteProfiles: ExtractionProfile[] = [];
-let editingProfileId: string | null = null;
-
-async function loadProfiles() {
-  const tabResp = await send({ type: "GET_ACTIVE_TAB" });
-  if (!tabResp.ok) { setStatus(tabResp.error, true); return; }
-  if (!("tab" in tabResp)) return;
-
-  const currentUrl = tabResp.tab.url;
-  el("current-url").textContent = new URL(currentUrl).hostname;
-  wiz.url = currentUrl;
-
-  const resp = await send({ type: "LIST_PROFILES_FOR_SITE", url: currentUrl });
-  if (!resp.ok) { setStatus(resp.error, true); return; }
-  if (!("profiles" in resp)) return;
-
-  siteProfiles = resp.profiles;
-  renderProfileList();
-}
-
-function renderProfileList() {
-  const list = el("profile-list");
-  list.innerHTML = "";
-
-  if (siteProfiles.length === 0) {
-    list.innerHTML = '<p class="empty-hint">No configurations for this site yet.</p>';
-    return;
-  }
-
-  for (const profile of siteProfiles) {
-    const failed = profile.status === "possibly_failed";
-    const isEditing = editingProfileId === profile.id;
-    const card = document.createElement("div");
-    card.className = `profile-card${failed ? " profile-card--failed" : ""}`;
-    card.dataset.id = profile.id;
-
-    card.innerHTML = isEditing
-      ? `
-        <div class="profile-card-main profile-card-main--edit">
-          <input class="profile-name-input" type="text" value="${escapeHtml(profile.name)}" data-id="${escapeHtml(profile.id)}" />
-          <div class="profile-card-actions">
-            <button class="btn-rename-save btn-primary btn-small" data-id="${escapeHtml(profile.id)}">Save</button>
-            <button class="btn-rename-cancel btn-ghost btn-small" data-id="${escapeHtml(profile.id)}">Cancel</button>
-          </div>
-        </div>
-        <div class="profile-card-meta">
-          <label class="profile-action-label">
-            Action
-            <select class="profile-action-select" data-id="${escapeHtml(profile.id)}">
-              ${actionOptions(profile.actionPreset.type)}
-            </select>
-          </label>
-          <span>Last run: ${formatTimeAgo(profile.lastRunAt)}</span>
-        </div>`
-      : `
-        <div class="profile-card-main">
-          <span class="profile-name">${failed ? "Warning: " : ""}${escapeHtml(profile.name)}</span>
-          <div class="profile-card-actions">
-            ${failed
-              ? `<button class="btn-repair btn-secondary btn-small" data-id="${escapeHtml(profile.id)}">Repair</button>`
-              : `<button class="btn-run btn-primary btn-small" data-id="${escapeHtml(profile.id)}">Run</button>`}
-            <button class="btn-rename btn-ghost btn-small" data-id="${escapeHtml(profile.id)}">Rename</button>
-            <button class="btn-delete btn-ghost btn-small btn-danger" data-id="${escapeHtml(profile.id)}">Delete</button>
-          </div>
-        </div>
-        <div class="profile-card-meta">
-          <label class="profile-action-label">
-            Action
-            <select class="profile-action-select" data-id="${escapeHtml(profile.id)}">
-              ${actionOptions(profile.actionPreset.type)}
-            </select>
-          </label>
-          <span>Last run: ${formatTimeAgo(profile.lastRunAt)}</span>
-        </div>`;
-
-    list.appendChild(card);
-  }
-
-  list.querySelectorAll<HTMLButtonElement>(".btn-run").forEach((btn) => {
-    btn.addEventListener("click", () => void runProfile(btn.dataset.id!));
-  });
-  list.querySelectorAll<HTMLButtonElement>(".btn-repair").forEach((btn) => {
-    btn.addEventListener("click", () => startRepair(btn.dataset.id!));
-  });
-  list.querySelectorAll<HTMLButtonElement>(".btn-rename").forEach((btn) => {
-    btn.addEventListener("click", () => startRenameProfile(btn.dataset.id!));
-  });
-  list.querySelectorAll<HTMLButtonElement>(".btn-rename-cancel").forEach((btn) => {
-    btn.addEventListener("click", () => cancelRenameProfile(btn.dataset.id!));
-  });
-  list.querySelectorAll<HTMLButtonElement>(".btn-rename-save").forEach((btn) => {
-    btn.addEventListener("click", () => void saveProfileName(btn.dataset.id!));
-  });
-  list.querySelectorAll<HTMLInputElement>(".profile-name-input").forEach((input) => {
-    input.addEventListener("keydown", (event) => {
-      if (event.key === "Enter") void saveProfileName(input.dataset.id!);
-      if (event.key === "Escape") cancelRenameProfile(input.dataset.id!);
-    });
-    input.focus();
-    input.select();
-  });
-  list.querySelectorAll<HTMLButtonElement>(".btn-delete").forEach((btn) => {
-    btn.addEventListener("click", () => void deleteSavedProfile(btn.dataset.id!));
-  });
-  list.querySelectorAll<HTMLSelectElement>(".profile-action-select").forEach((select) => {
-    select.addEventListener("change", () => void saveProfileAction(select.dataset.id!, select.value as ActionPreset["type"]));
-  });
-}
-
-function startRenameProfile(profileId: string) {
-  editingProfileId = profileId;
-  clearStatus();
-  renderProfileList();
-}
-
-function cancelRenameProfile(profileId: string) {
-  if (editingProfileId !== profileId) return;
-  editingProfileId = null;
-  clearStatus();
-  renderProfileList();
-}
-
-async function saveProfileName(profileId: string) {
-  const input = document.querySelector<HTMLInputElement>(`.profile-name-input[data-id="${CSS.escape(profileId)}"]`);
-  const name = input?.value.trim() ?? "";
-  if (!name) {
-    setStatus("Please enter a configuration name.", true);
-    input?.focus();
-    return;
-  }
-
-  const resp = await send({
-    type: "UPDATE_PROFILE",
-    profileId,
-    updates: { name, urlPattern: createUrlPattern(wiz.url), updatedAt: new Date().toISOString() },
-  });
-  if (!resp.ok) { setStatus(resp.error, true); return; }
-
-  editingProfileId = null;
-  setStatus("Configuration renamed.");
-  await loadProfiles();
-}
-
-async function deleteSavedProfile(profileId: string) {
-  const profile = siteProfiles.find((p) => p.id === profileId);
-  if (!profile) return;
-  if (!window.confirm(`Delete "${profile.name}"? This cannot be undone.`)) return;
-
-  const resp = await send({ type: "DELETE_PROFILE", profileId });
-  if (!resp.ok) { setStatus(resp.error, true); return; }
-
-  if (editingProfileId === profileId) editingProfileId = null;
-  setStatus("Configuration deleted.");
-  await loadProfiles();
-}
-
-async function saveProfileAction(profileId: string, actionType: ActionPreset["type"]) {
-  const resp = await send({
-    type: "UPDATE_PROFILE",
-    profileId,
-    updates: {
-      actionPreset: { type: actionType },
-      urlPattern: createUrlPattern(wiz.url),
-      updatedAt: new Date().toISOString(),
-    },
-  });
-  if (!resp.ok) { setStatus(resp.error, true); return; }
-
-  setStatus("Action updated.");
-  await loadProfiles();
-}
-
-async function runProfile(profileId: string) {
-  setStatus("Running...");
-  const select = document.querySelector<HTMLSelectElement>(`.profile-action-select[data-id="${CSS.escape(profileId)}"]`);
-  const actionPresetOverride = select ? { type: select.value as ActionPreset["type"] } : undefined;
-
-  // Step 1: Run the recipe in background (handles status update, no transform/action)
-  const recipeResp = await send({ type: "RUN_RECIPE_FOR_PROFILE", profileId, actionPresetOverride });
-  if (!recipeResp.ok) { setStatus(recipeResp.error, true); return; }
-  if (!("result" in recipeResp) || !("profile" in recipeResp)) return;
-
-  const profile = recipeResp.profile as ExtractionProfile;
-  const result = recipeResp.result as ExtractionResult;
-
-  // Step 2: Run transform in sandbox (safe new Function via unsafe-eval iframe)
-  let exportResult: ExportResult;
-  if (profile.transform) {
-    try {
-      exportResult = await runTransformInSandbox(profile.transform, result.data);
-    } catch (err) {
-      setStatus(`Transform failed: ${err instanceof Error ? err.message : String(err)}`, true);
-      return;
-    }
-  } else {
-    exportResult = { formatLabel: "JSON", content: JSON.stringify(result.data, null, 2), warnings: [] };
-  }
-
-  // Step 3: Apply action
-  const actionPreset = actionPresetOverride ?? profile.actionPreset;
-  const errors: string[] = [];
-  let copied = false;
-  let downloaded = false;
-
-  if (actionPreset.type === "copy" || actionPreset.type === "copy_download") {
-    try {
-      await navigator.clipboard.writeText(exportResult.content);
-      copied = true;
-    } catch (err) {
-      errors.push(`Copy failed: ${err instanceof Error ? err.message : String(err)}`);
-    }
-  }
-
-  if (actionPreset.type === "download" || actionPreset.type === "copy_download") {
-    const dlResp = await send({ type: "DOWNLOAD_EXPORT", exportResult, profileId });
-    if (dlResp.ok) {
-      downloaded = true;
-    } else if (!dlResp.ok) {
-      errors.push(dlResp.error);
-    }
-  }
-
-  if (errors.length > 0) {
-    setStatus(`Run failed: ${errors[0]}`, true);
-  } else {
-    const parts = ([copied && "Copied", downloaded && "Downloaded"] as (string | false)[])
-      .filter(Boolean)
-      .join(" / ");
-    setStatus(parts || "Done");
-    await loadProfiles();
-  }
-}
-
-// ── Codex Studio: Snapshot ─────────────────────────────────────────────────
-
-async function ensureSnapshot(): Promise<string | null> {
-  if (wiz.snapshot) return wiz.snapshot;
-  const resp = await send({ type: "CREATE_SNAPSHOT" });
-  if (!resp.ok) { setStatus(resp.error, true); return null; }
-  if (!("snapshot" in resp)) return null;
-  wiz.snapshot = resp.snapshot;
-  wiz.url = resp.url;
-  return wiz.snapshot;
-}
-
-// ── Codex Studio: Core extraction flow ────────────────────────────────────
-
-async function onExtract() {
-  clearStatus();
-  wiz.intent = el<HTMLTextAreaElement>("cs-intent").value.trim();
-  await doExtractAndFormat();
-}
-
-async function doExtractAndFormat() {
-  showScreen("extracting");
-  resetProcessView("Preparing page snapshot");
-
-  const snapshot = await ensureSnapshot();
-  if (!snapshot) { showScreen("entry"); return; }
-  appendProcessLog("stage", "Captured page snapshot");
-
-  let intent = wiz.intent;
-  let confirmedFields: string[] | undefined;
-
-  if (!intent) {
-    const ar = await send({ type: "ANALYZE_INTENT", domSnapshot: snapshot, url: wiz.url });
-    if (!ar.ok || !("analysis" in ar)) {
-      setStatus(ar.ok ? "Analysis failed" : ar.error, true);
-      showScreen("entry");
-      return;
-    }
-    confirmedFields = ar.analysis.suggestedFields.map((f) => f.name);
-    intent = confirmedFields.join(", ");
-    wiz.intent = intent;
-    appendProcessLog("stage", "Auto-detected extraction intent");
-  }
-
-  let gr: { recipe: ExtractionRecipe };
-  try {
-    gr = await streamBackend<{ recipe: ExtractionRecipe }>("/generate-recipe/stream", {
-    intent,
-    domSnapshot: snapshot,
-    url: wiz.url,
-    confirmedFields,
-    });
-  } catch (error) {
-    setStatus(error instanceof Error ? error.message : String(error), true);
-    showScreen("entry");
-    return;
-  }
-
-  wiz.recipe = gr.recipe;
-  appendProcessLog("stage", "Running recipe in current page");
-  const run = await send({ type: "RUN_RECIPE_PREVIEW", recipe: gr.recipe });
-  if (!run.ok || !("result" in run)) {
-    const message = run.ok ? "Recipe run failed" : run.error;
-    appendProcessLog("error", message, true);
-    setStatus(message, true);
-    showScreen("entry");
-    return;
-  }
-  wiz.result = run.result;
-  appendProcessArtifact("Extraction result", wiz.result.data);
-
-  await applyAutoFormat();
-  renderResult();
-  showScreen("result");
-}
-
-async function applyAutoFormat(hint = "") {
-  if (!wiz.result) return;
-  const outputRequest = hint || "auto";
-  try {
-    const fr = await streamBackend<{ transform: TransformSpec | null; exportResult: ExportResult }>("/transform/stream", {
-    outputRequest,
-    intent: wiz.intent || "Extract the main content",
-    result: wiz.result,
-    });
-    wiz.transform = fr.transform;
-    wiz.exportResult = fr.exportResult;
-  } catch (error) {
-    appendProcessLog("error", error instanceof Error ? error.message : String(error), true);
-  }
-}
-
-function renderResult() {
-  const er = wiz.exportResult;
-  el("cs-format-label").textContent = er?.formatLabel ?? "JSON";
-  el("cs-result-content").textContent = er?.content ?? JSON.stringify(wiz.result?.data, null, 2);
-  el<HTMLTextAreaElement>("cs-result-feedback").value = "";
-}
-
-// ── Codex Studio: Refine ──────────────────────────────────────────────────
-
-async function onRefine() {
-  clearStatus();
-  const feedback = el<HTMLTextAreaElement>("cs-result-feedback").value.trim();
-  if (!feedback) { setStatus("Describe what you'd like to change.", true); return; }
-  if (!wiz.recipe || !wiz.result) return;
-
-  setBtnLoading("btn-refine", true);
-  showScreen("extracting");
-  resetProcessView("Preparing refinement");
-
-  const snapshot = await ensureSnapshot();
-  if (!snapshot) { showScreen("result"); setBtnLoading("btn-refine", false); return; }
-
-  let rr: RefineStreamResult;
-  try {
-    rr = await streamBackend<RefineStreamResult>("/refine/stream", {
-      feedback,
-      intent: wiz.intent || "Extract the main content",
-      currentRecipe: wiz.recipe,
-      currentResult: wiz.result,
-      domSnapshot: snapshot,
-      url: wiz.url,
-    });
-  } catch (error) {
-    setStatus(error instanceof Error ? error.message : String(error), true);
-    showScreen("result");
-    setBtnLoading("btn-refine", false);
-    return;
-  }
-
-  wiz.recipe = rr.artifact.recipe;
-  appendProcessLog("stage", "Running refined recipe in current page");
-  const run = await send({ type: "RUN_RECIPE_PREVIEW", recipe: wiz.recipe });
-  if (!run.ok || !("result" in run)) {
-    const message = run.ok ? "Recipe run failed" : run.error;
-    appendProcessLog("error", message, true);
-    setStatus(message, true);
-    showScreen("result");
-    setBtnLoading("btn-refine", false);
-    return;
-  }
-  wiz.result = run.result;
-  appendProcessArtifact("Extraction result", wiz.result.data);
-
-  if (rr.exportResult) {
-    wiz.transform = rr.artifact.transform ?? null;
-    wiz.exportResult = rr.exportResult;
-  } else if (rr.artifact.transform) {
-    appendProcessLog("stage", "Running refined transform preview");
-    const tr = await send({ type: "RUN_TRANSFORM_PREVIEW", transform: rr.artifact.transform, data: wiz.result.data });
-    if (tr.ok && "exportResult" in tr) {
-      wiz.transform = rr.artifact.transform;
-      wiz.exportResult = tr.exportResult;
-      appendProcessArtifact("Formatted preview", tr.exportResult.content);
-    } else {
-      appendProcessLog("error", tr.ok ? "Transform preview failed" : tr.error, true);
-      await applyAutoFormat();
-    }
-  } else {
-    await applyAutoFormat();
-  }
-
-  renderResult();
-  showScreen("result");
-  setBtnLoading("btn-refine", false);
-}
-
-// ── Codex Studio: Repair ──────────────────────────────────────────────────
-
-function startRepair(profileId: string) {
-  const profile = siteProfiles.find((p) => p.id === profileId);
-  if (!profile) return;
-  wiz.repairProfileId = profileId;
-  wiz.intent = profile.intent;
-  el("cs-repair-name").textContent = profile.name;
-  el("cs-repair-reason").textContent = "Last run returned empty or failed results.";
-  el<HTMLTextAreaElement>("cs-repair-note").value = "";
-  switchTab("codex");
-  showScreen("repair");
-}
-
-async function onStartRepair() {
-  clearStatus();
-  if (!wiz.repairProfileId) return;
-  const userNote = el<HTMLTextAreaElement>("cs-repair-note").value.trim() || undefined;
-  showScreen("extracting");
-  resetProcessView("Preparing repair");
-
-  const snapshot = await ensureSnapshot();
-  if (!snapshot) { showScreen("repair"); return; }
-
-  const profile = siteProfiles.find((p) => p.id === wiz.repairProfileId);
-  if (!profile) {
-    setStatus("Profile not found.", true);
-    showScreen("repair");
-    return;
-  }
-
-  let resp: { recipe: ExtractionRecipe };
-  try {
-    resp = await streamBackend<{ recipe: ExtractionRecipe }>("/repair-recipe/stream", {
-      url: wiz.url,
-      intent: profile.intent,
-      domSnapshot: snapshot,
-      oldRecipe: profile.recipe,
-      userNote,
-    });
-  } catch (error) {
-    setStatus(error instanceof Error ? error.message : String(error), true);
-    showScreen("repair");
-    return;
-  }
-
-  wiz.recipe = resp.recipe;
-  appendProcessLog("stage", "Running repaired recipe in current page");
-  const run = await send({ type: "RUN_RECIPE_PREVIEW", recipe: resp.recipe });
-  if (!run.ok || !("result" in run)) {
-    const message = run.ok ? "Recipe run failed" : run.error;
-    appendProcessLog("error", message, true);
-    setStatus(message, true);
-    showScreen("repair");
-    return;
-  }
-  wiz.result = run.result;
-  appendProcessArtifact("Extraction result", wiz.result.data);
-
-  await applyAutoFormat();
-  renderResult();
-  showScreen("result");
-}
-
-// ── Codex Studio: Save ────────────────────────────────────────────────────
-
-function generateId(): string {
-  return `profile-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-}
-
-async function onSaveConfig() {
-  clearStatus();
-  if (!wiz.recipe) { setStatus("No recipe to save.", true); return; }
-
-  const name = el<HTMLInputElement>("cs-config-name").value.trim();
-  if (!name) { setStatus("Please enter a configuration name.", true); return; }
-
+function buildProfileFromArtifact(artifact: ExtractionArtifact, baseProfile: ExtractionProfile | null): ExtractionProfile {
   const now = new Date().toISOString();
-  const isRepair = !!wiz.repairProfileId;
-  const existing = isRepair ? siteProfiles.find((p) => p.id === wiz.repairProfileId) : undefined;
-
-  const profile: ExtractionProfile = {
-    id: wiz.repairProfileId ?? generateId(),
-    name,
-    urlPattern: existing?.urlPattern ?? createUrlPattern(wiz.url),
-    intent: wiz.intent || "Extract the main content",
-    recipe: wiz.recipe,
-    transform: wiz.transform ?? undefined,
-    outputDescription: wiz.exportResult?.formatLabel,
-    actionPreset: existing?.actionPreset ?? { type: "copy" },
-    isDefault: existing?.isDefault ?? false,
+  return extractionProfileSchema.parse({
+    id: `profile-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    name: "Generated candidate",
+    urlPattern: baseProfile?.urlPattern ?? createUrlPattern(currentUrl),
+    recipe: artifact.recipe,
+    script: artifact.script,
+    actionPreset: baseProfile?.actionPreset ?? { type: "copy" },
     status: "ok",
-    lastRunAt: now,
-    createdAt: existing?.createdAt ?? now,
+    createdAt: now,
     updatedAt: now,
-    version: (existing?.version ?? 0) + 1,
+    version: 1,
+  });
+}
+
+async function runBaseProfileForRevise(baseProfile: ExtractionProfile) {
+  const response = await send({ type: "RUN_PROFILE_PREVIEW", profile: baseProfile });
+  if (!response.ok) {
+    return { ok: false, error: response.error };
+  }
+  if (!("scriptInput" in response)) {
+    return { ok: false, error: "Base profile preview failed." };
+  }
+  return {
+    ok: response.extraction.ok,
+    extraction: response.extraction,
+    scriptInput: response.scriptInput,
+    output: response.output,
   };
-
-  const resp = await send({ type: "SAVE_PROFILE", profile });
-  if (!resp.ok) { setStatus(resp.error, true); return; }
-
-  setStatus(isRepair ? "Configuration repaired and saved." : "Configuration saved.");
-  resetWizard();
-  switchTab("quickrun");
-  await loadProfiles();
 }
 
-function resetWizard() {
-  wiz.repairProfileId = null;
-  wiz.snapshot = "";
-  wiz.recipe = null;
-  wiz.result = null;
-  wiz.transform = null;
-  wiz.exportResult = null;
-  wiz.intent = "";
-  el<HTMLTextAreaElement>("cs-intent").value = "";
-  showScreen("entry");
+async function generateArtifact() {
+  clearStatus();
+  const instructions = el<HTMLTextAreaElement>("studio-instructions").value.trim();
+  const baseProfileId = el<HTMLSelectElement>("studio-base-profile").value;
+  const baseProfile = baseProfileId ? profiles.find((profile) => profile.id === baseProfileId) ?? null : null;
+  if (baseProfile && !instructions) {
+    setStatus("Describe what to change when using a base profile.", true);
+    return;
+  }
+
+  showStudioGenerating("Preparing page snapshot");
+  setLoading("btn-generate", true);
+  try {
+    const snapshotResponse = await send({ type: "CREATE_SNAPSHOT" });
+    if (!snapshotResponse.ok || !("snapshot" in snapshotResponse)) {
+      throw new Error(snapshotResponse.ok ? "Snapshot failed." : snapshotResponse.error);
+    }
+
+    const request: GenerateArtifactRequest = {
+      url: snapshotResponse.url,
+      domSnapshot: snapshotResponse.snapshot,
+      mode: selectGenerateMode(!!baseProfile, instructions),
+      intent: !baseProfile && instructions ? instructions : undefined,
+      userNote: baseProfile ? instructions : undefined,
+      baseProfile: baseProfile ?? undefined,
+      baseRun: baseProfile ? await runBaseProfileForRevise(baseProfile) : undefined,
+    };
+
+    const result = await streamBackend<{ artifact: ExtractionArtifact }>("/generate-artifact/stream", request);
+    const artifact = extractionArtifactSchema.parse(result.artifact);
+    const candidate = buildProfileFromArtifact(artifact, baseProfile);
+    appendProcessLog("stage", "Running generated profile through the shared preview runner");
+    const preview = await send({ type: "RUN_PROFILE_PREVIEW", profile: candidate });
+    if (!preview.ok || !("scriptInput" in preview)) {
+      throw new Error(preview.ok ? "Generated profile preview failed." : preview.error);
+    }
+    appendArtifact("Script input", preview.scriptInput);
+    appendArtifact("Preview output", preview.output);
+    showEditor(candidate, {
+      source: "studio-candidate",
+      namePlaceholder: artifact.outputDescription || (baseProfile ? `${baseProfile.name} v2` : "Generated profile name"),
+    });
+    el("preview-input").textContent = preview.scriptInput;
+    el("preview-output").textContent = preview.output;
+    el<HTMLDetailsElement>("preview-panel").open = true;
+    setStatus(preview.extraction.ok ? "Generated profile preview complete." : "Generated profile has extraction warnings.", !preview.extraction.ok);
+  } catch (error) {
+    setStatus(error instanceof Error ? error.message : String(error), true);
+    showStudioEntry();
+  } finally {
+    setLoading("btn-generate", false);
+  }
 }
-
-// ── Tab switching ──────────────────────────────────────────────────────────
-
-function switchTab(tab: "codex" | "quickrun") {
-  const isCodex = tab === "codex";
-  el("panel-codex").classList.toggle("hidden", !isCodex);
-  el("panel-quickrun").classList.toggle("hidden", isCodex);
-  el("tab-codex").classList.toggle("active", isCodex);
-  el("tab-quickrun").classList.toggle("active", !isCodex);
-}
-
-// ── Bootstrap ──────────────────────────────────────────────────────────────
 
 async function init() {
-  switchTab("quickrun");
-  showScreen("entry");
-  await loadProfiles();
-
-  el("tab-codex").addEventListener("click", () => switchTab("codex"));
-  el("tab-quickrun").addEventListener("click", () => switchTab("quickrun"));
-  el("btn-new-config").addEventListener("click", () => { switchTab("codex"); showScreen("entry"); });
-
-  el("btn-extract").addEventListener("click", () => void onExtract());
-  el("btn-start-over").addEventListener("click", () => resetWizard());
-
-  el("btn-refine").addEventListener("click", () => void onRefine());
-  el("btn-result-next").addEventListener("click", () => {
-    el<HTMLInputElement>("cs-config-name").value = "";
-    showScreen("save");
+  el("btn-new").addEventListener("click", () => showEditor(null));
+  el("scope-current").addEventListener("click", () => {
+    listScope = "current";
+    void load();
   });
-
-  el("btn-save-back").addEventListener("click", () => showScreen("result"));
-  el("btn-save-config").addEventListener("click", () => void onSaveConfig());
-
-  el("btn-repair-back").addEventListener("click", () => { wiz.repairProfileId = null; switchTab("quickrun"); });
-  el("btn-repair-start").addEventListener("click", () => void onStartRepair());
+  el("scope-all").addEventListener("click", () => {
+    listScope = "all";
+    void load();
+  });
+  el("tab-quickrun").addEventListener("click", () => switchTab("quickrun"));
+  el("tab-studio").addEventListener("click", () => {
+    switchTab("studio");
+    showStudioEntry();
+  });
+  el("btn-back").addEventListener("click", () => {
+    showList();
+    void load();
+  });
+  el("btn-save").addEventListener("click", () => void saveProfile());
+  el("btn-preview").addEventListener("click", () => void previewProfile());
+  el("btn-generate").addEventListener("click", () => void generateArtifact());
+  await load();
 }
 
 document.addEventListener("DOMContentLoaded", () => void init());

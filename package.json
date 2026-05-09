@@ -10,7 +10,7 @@
   ],
   "scripts": {
     "build": "npm run build -w @extractor/shared && npm run build -w @extractor/backend && npm run build -w @extractor/extension",
-    "test": "npm run test -w @extractor/shared && npm run test -w @extractor/backend",
+    "test": "npm run test -w @extractor/shared && npm run test -w @extractor/backend && npm run test -w @extractor/extension",
     "dev:backend": "npm run dev -w @extractor/backend",
     "build:extension": "npm run build -w @extractor/extension"
   },

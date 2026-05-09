@@ -1,0 +1,38 @@
+{
+  "manifest_version": 3,
+  "name": "WebRelay",
+  "version": "0.1.0",
+  "description": "Capture structured web content and relay it through reusable extraction profiles.",
+  "permissions": ["activeTab", "storage", "scripting", "downloads", "clipboardWrite", "offscreen"],
+  "host_permissions": ["http://localhost:8787/*"],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Extract content"
+  },
+  "commands": {
+    "run-last-profile": {
+      "suggested_key": {
+        "default": "Alt+Shift+E",
+        "mac": "Alt+Shift+E"
+      },
+      "description": "Run last used extraction profile for this site"
+    }
+  },
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "sandbox": {
+    "pages": ["sandbox.html"]
+  },
+  "content_security_policy": {
+    "sandbox": "sandbox allow-scripts; script-src 'self' 'unsafe-eval'; object-src 'self'"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
