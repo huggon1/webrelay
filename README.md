@@ -28,8 +28,6 @@ npm run build
 
 Load `extension/dist` as an unpacked extension in Chrome.
 
-For manual testing, open `test-pages/chatbot.html` in Chrome and follow the sample config in `test-pages/chatbot-config.md`.
-
 ---
 
 ## Codex Studio (backend)
