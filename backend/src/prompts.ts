@@ -105,40 +105,18 @@ Suggest 3-8 of the most useful fields.
 `;
 }
 
-export function buildRepairPrompt(input: {
-  url: string;
-  intent: string;
-  domSnapshot: string;
-  oldRecipe: ExtractionRecipe;
-  userNote?: string;
-}) {
-  return `
-Repair this extraction recipe for the current page. Keep the user's intent, but update selectors and fields so the recipe works with the current DOM.
-
-URL:
-${input.url}
-
-User extraction intent:
-${input.intent}
-${input.userNote ? `\nUser note:\n${input.userNote}` : ""}
-Old recipe:
-${JSON.stringify(input.oldRecipe, null, 2)}
-
-Current page DOM snapshot:
-${input.domSnapshot}
-
-${recipeContract}
-`;
-}
-
 export function buildGeneratePrompt(input: {
   url: string;
   intent: string;
   domSnapshot: string;
   confirmedFields?: string[];
+  baseRecipe?: ExtractionRecipe;
 }) {
   const fieldsSection = input.confirmedFields && input.confirmedFields.length > 0
     ? `\nConfirmed fields to extract (use these exact names):\n${input.confirmedFields.map((f) => `- ${f}`).join("\n")}\n`
+    : "";
+  const baseSection = input.baseRecipe
+    ? `\nBase recipe to use as the starting point:\n${JSON.stringify(input.baseRecipe, null, 2)}\n\nTreat the user's extraction intent as the requested adjustment to this base configuration. Keep useful selectors and fields from the base recipe, update them for the current DOM when needed, and return a complete new recipe. Do not assume the saved base configuration will be overwritten.\n`
     : "";
   return `
 You generate a reusable browser content extraction recipe for the current page.
@@ -149,6 +127,7 @@ ${input.url}
 User extraction intent:
 ${input.intent}
 ${fieldsSection}
+${baseSection}
 Page DOM snapshot:
 ${input.domSnapshot}
 

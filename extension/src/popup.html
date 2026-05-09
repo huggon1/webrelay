@@ -41,6 +41,10 @@
         <div id="cs-entry" class="cs-screen">
           <p class="cs-hint">Describe what to extract, or leave blank to auto-detect.</p>
           <label class="field-label">
+            Base configuration
+            <select id="cs-base-config"></select>
+          </label>
+          <label class="field-label">
             Intent (optional)
             <textarea id="cs-intent" rows="3" placeholder="e.g. Extract product name, price, and description"></textarea>
           </label>
@@ -85,20 +89,6 @@
           <div class="row-btns">
             <button id="btn-save-back" class="btn-ghost">Back</button>
             <button id="btn-save-config" class="btn-primary">Save configuration</button>
-          </div>
-        </div>
-
-        <!-- Screen: Repair entry -->
-        <div id="cs-repair" class="cs-screen hidden">
-          <p class="cs-label">Repairing: <strong id="cs-repair-name"></strong></p>
-          <p id="cs-repair-reason" class="cs-hint"></p>
-          <label class="field-label">
-            Additional notes (optional)
-            <textarea id="cs-repair-note" rows="2" placeholder="e.g. The page layout changed last week"></textarea>
-          </label>
-          <div class="row-btns">
-            <button id="btn-repair-back" class="btn-ghost">Cancel</button>
-            <button id="btn-repair-start" class="btn-primary">Start repair</button>
           </div>
         </div>
       </div>

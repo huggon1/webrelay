@@ -382,6 +382,7 @@ chrome.runtime.onMessage.addListener(
             intent: message.intent,
             domSnapshot: message.domSnapshot,
             confirmedFields: message.confirmedFields,
+            baseRecipe: message.baseRecipe,
           });
           const recipe = extractionRecipeSchema.parse(payload.recipe);
           // Run the recipe immediately for preview
@@ -444,25 +445,6 @@ chrome.runtime.onMessage.addListener(
           const transform = transformSpecSchema.parse(message.transform);
           const exportResult = await runTransformViaOffscreen(transform, message.data);
           sendResponse({ ok: true, transform, exportResult });
-          return;
-        }
-
-        if (message.type === "REPAIR_RECIPE") {
-          const profiles = await getProfiles();
-          const profile = profiles.find((p) => p.id === message.profileId);
-          if (!profile) throw new Error("Profile not found.");
-          const payload = await postBackend("/repair-recipe", {
-            url: message.url,
-            intent: profile.intent,
-            domSnapshot: message.domSnapshot,
-            oldRecipe: profile.recipe,
-            userNote: message.userNote,
-          });
-          const recipe = extractionRecipeSchema.parse(payload.recipe);
-          const contentResponse = await sendToContentByActiveTab({ type: "RUN_RECIPE", recipe });
-          if (!contentResponse.ok) throw new Error(contentResponse.error);
-          if (!("result" in contentResponse)) throw new Error("Recipe run response incomplete.");
-          sendResponse({ ok: true, recipe, result: contentResponse.result });
           return;
         }
 

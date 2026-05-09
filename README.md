@@ -34,7 +34,7 @@ Start the backend:
 npm run dev:backend
 ```
 
-The backend runs at `http://localhost:8787` and is only needed for Codex Studio (creating and repairing configurations). Quick Run and the keyboard shortcut work without it.
+The backend runs at `http://localhost:8787` and is only needed for Codex Studio (creating or adjusting configurations). Quick Run and the keyboard shortcut work without it.
 
 ### Backend config
 
