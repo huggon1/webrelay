@@ -10,22 +10,6 @@ import {
 import type { BackgroundRequest, BackgroundResponse, GenerateArtifactRequest, StudioJob } from "./messages.js";
 import { selectGenerateMode } from "./studio-mode.js";
 
-const sampleRecipe = {
-  version: 1,
-  mode: "list",
-  rootSelector: ".chat-message",
-  fields: [
-    { name: "role", value: "attribute", attribute: "data-role", required: true },
-    { name: "time", selector: ".message-time", value: "textContent", required: true },
-    { name: "text", selector: ".message-text", value: "textContent", required: true },
-  ],
-};
-
-const sampleScript = String.raw`const messages = JSON.parse(input);
-return messages
-  .map((m) => \`### \${m.role} \${m.time ? \`(\${m.time})\` : ""}\n\n\${m.text}\`)
-  .join("\n\n---\n\n");`;
-
 let currentUrl = "";
 let profiles: ExtractionProfile[] = [];
 let editingProfile: ExtractionProfile | null = null;
@@ -128,8 +112,8 @@ function showEditor(
   nameInput.placeholder = editorSource === "manual-edit" ? "Profile name" : "";
   el<HTMLInputElement>("profile-url-pattern").value = profile?.urlPattern ?? createUrlPattern(currentUrl);
   el<HTMLSelectElement>("profile-action").value = profile?.actionPreset.type ?? "copy";
-  el<HTMLTextAreaElement>("profile-recipe").value = JSON.stringify(profile?.recipe ?? sampleRecipe, null, 2);
-  el<HTMLTextAreaElement>("profile-script").value = profile?.script.code ?? sampleScript;
+  el<HTMLTextAreaElement>("profile-recipe").value = profile ? JSON.stringify(profile.recipe, null, 2) : "";
+  el<HTMLTextAreaElement>("profile-script").value = profile?.script.code ?? "";
   el("preview-input").textContent = "";
   el("preview-output").textContent = "";
   el<HTMLDetailsElement>("preview-panel").open = false;
