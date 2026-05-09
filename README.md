@@ -1,40 +1,46 @@
 # WebRelay
 
-Chrome extension + local Node backend for structured web content extraction.
+> Extract anything from any webpage — locally, silently, repeatably.
 
-Capture a page, let Codex generate a reusable extraction recipe, then run it anytime from the popup or keyboard shortcut — no Codex call needed on repeat runs.
+WebRelay is a Chrome MV3 extension that lets you build reusable extraction profiles for any site. Describe what you want to extract, let Codex generate a profile, then run it with a single keystroke — no cloud, no subscription, no repeated copy-paste.
 
-## Requirements
+**Local-first at runtime.** Once a profile is saved, Quick Run and `Alt+Shift+E` work entirely inside the extension. The optional backend is only needed when you want to create or revise profiles with Codex Studio.
 
-- Node.js 18+
-- [Codex CLI](https://github.com/openai/codex) installed and logged in
+---
 
-```bash
-npm install -g @openai/codex@latest
-codex --login
-```
+## Features
+
+- **Codex Studio** — describe your intent or leave it blank, and Codex generates a recipe + JS transform for you
+- **Quick Run** — one-click execution for saved profiles, with Copy / Download / Copy+Download output modes
+- **Keyboard shortcut** — `Alt+Shift+E` silently runs the last profile for the current site, no popup needed
+- **Hostname scoping** — a profile saved on `example.com/products/1` works across all `example.com` pages
+- **Revision workflow** — run the existing profile first, then refine with feedback; Codex sees the actual output
+
+---
 
 ## Setup
 
 ```bash
 npm install
+npm test
+npm run build
 ```
 
-Build the extension:
+Load `extension/dist` as an unpacked extension in Chrome.
 
-```bash
-npm run build:extension
-```
+For manual testing, open `test-pages/chatbot.html` in Chrome and follow the sample config in `test-pages/chatbot-config.md`.
 
-Load `extension/dist` as an unpacked extension in Chrome (`chrome://extensions` → Developer mode → Load unpacked).
+---
 
-Start the backend:
+## Codex Studio (backend)
+
+The backend powers profile generation. It requires a local Codex SDK/CLI login.
 
 ```bash
 npm run dev:backend
 ```
 
-The backend runs at `http://localhost:8787` and is only needed for Codex Studio (creating or adjusting configurations). Quick Run and the keyboard shortcut work without it.
+The backend runs at `http://localhost:8787`. Once you've saved a profile, you can stop the backend — Quick Run and the keyboard shortcut keep working without it.
 
 ### Backend config
 
@@ -47,34 +53,42 @@ CODEX_REASONING_EFFORT=
 CODEX_WORKING_DIRECTORY=
 ```
 
+---
+
 ## Usage
 
 ### Codex Studio
 
-Opens when you click the extension icon on any HTTP/HTTPS page.
+Click the extension icon on any HTTP/HTTPS page to open the popup, then switch to the **Codex Studio** tab.
 
-1. Enter an extraction intent, or leave blank to let Codex suggest fields.
-2. Review the extracted preview.
-3. Refine with feedback if needed.
-4. Save the configuration.
-
-Configurations are scoped to hostname — a config saved on `example.com/products/1` works across all `example.com` paths.
+1. Enter an extraction intent, or leave blank to let Codex suggest what's worth extracting.
+2. Review the generated recipe and the live preview output.
+3. Add feedback to refine — Codex sees the current output and adjusts accordingly.
+4. Save the profile when it looks right.
 
 ### Quick Run
 
-The default tab. Lists saved configurations for the current hostname.
+The **Quick Run** tab (default) lists all profiles saved for the current hostname.
 
-Each configuration can be run, renamed, deleted, or switched between **Copy**, **Download**, and **Copy + Download**. The selected action persists and is reused by the shortcut.
+Each profile can be:
+- **Run** — executes the recipe + transform and applies the saved action
+- **Edited** — opens the manual editor to tweak the recipe or transform directly
+- **Deleted** — removes the profile
+- **Action switched** — toggle between **Copy**, **Download**, and **Copy + Download** per profile; the choice persists and is reused by the keyboard shortcut
 
 ### Keyboard shortcut
 
-`Alt+Shift+E` — runs the last successfully used configuration for the current hostname silently, no popup needed. Rebind at `chrome://extensions/shortcuts`.
+`Alt+Shift+E` — silently runs the last successfully used profile for the current hostname. No popup, no clicks. If nothing has been run yet on this site, a toast appears instead.
+
+Rebind at `chrome://extensions/shortcuts`.
+
+---
 
 ## Development
 
 ```bash
-npm test                           # all tests
-npm test -w @extractor/shared      # shared only
-npm test -w @extractor/backend     # backend only
-npx tsc -p extension/tsconfig.json --noEmit  # extension type check
+npm test                                          # run all tests
+npm test -w @extractor/shared                     # shared package only
+npm test -w @extractor/backend                    # backend only
+npx tsc -p extension/tsconfig.json --noEmit       # extension type check
 ```

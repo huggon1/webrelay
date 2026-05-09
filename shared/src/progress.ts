@@ -16,7 +16,7 @@ export type CodexProgressEvent =
     }
   | {
       type: "artifact";
-      artifactType: "recipe" | "transform" | "result" | "raw";
+      artifactType: "recipe" | "script" | "result" | "raw";
       label: string;
       content: unknown;
     }
@@ -33,4 +33,3 @@ export type CodexProgressEvent =
       type: "done";
       result: unknown;
     };
-

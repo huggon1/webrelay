@@ -4,13 +4,14 @@ import {
   extractionArtifactSchema,
   extractionProfileSchema,
   extractionRecipeSchema,
-  exportResultSchema,
   lastUsedStateSchema,
   matchesUrlPattern,
-  transformSpecSchema,
+  scriptConfigSchema,
   type ActionPreset,
-  type ExportResult,
+  type CodexProgressEvent,
+  type ExtractionArtifact,
   type ExtractionProfile,
+  type ExtractionResult,
 } from "@extractor/shared";
 import type {
   ActionRunResult,
@@ -18,17 +19,22 @@ import type {
   BackgroundResponse,
   ContentRequest,
   ContentResponse,
-  IntentAnalysis,
+  GenerateArtifactResult,
+  OffscreenResponse,
+  ProfileRunResult,
+  StudioJob,
   ToastVariant,
 } from "./messages.js";
 
+const PROFILES_KEY = "profilesV1";
+const LAST_USED_BY_SITE_KEY = "lastUsedBySiteV1";
+const STUDIO_JOB_KEY = "studioJobV1";
 const BACKEND_URL = "http://localhost:8787";
-const PROFILES_KEY = "profiles";
-const LAST_USED_BY_SITE_KEY = "lastUsedBySite";
 const OFFSCREEN_COPY_MESSAGE = "OFFSCREEN_COPY";
-const OFFSCREEN_TRANSFORM_MESSAGE = "OFFSCREEN_TRANSFORM";
+const OFFSCREEN_RUN_SCRIPT_MESSAGE = "OFFSCREEN_RUN_SCRIPT";
 
-// ── Tab utilities ──────────────────────────────────────────────────────────
+let activeStudioAbortController: AbortController | null = null;
+let activeStudioJobId: string | null = null;
 
 async function getActiveTab() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -38,12 +44,17 @@ async function getActiveTab() {
 
 function ensureInjectableTab(urlValue: string) {
   const url = new URL(urlValue);
-  if (url.protocol !== "http:" && url.protocol !== "https:") {
-    throw new Error("WebRelay can only inspect regular http and https pages.");
+  if (!["http:", "https:", "file:"].includes(url.protocol)) {
+    throw new Error("WebRelay can only inspect http, https, and local file pages.");
   }
   if (url.hostname === "chromewebstore.google.com") {
     throw new Error("Chrome does not allow extensions to inspect the Chrome Web Store.");
   }
+}
+
+function siteIdForUrl(urlValue: string) {
+  const url = new URL(urlValue);
+  return url.protocol === "file:" ? "file://" : url.hostname;
 }
 
 function isMissingContentScriptError(error: unknown) {
@@ -61,34 +72,22 @@ async function sendToContent(tabId: number, message: ContentRequest): Promise<Co
   }
 }
 
-async function sendToContentByActiveTab(
-  message: Extract<ContentRequest, { type: "CREATE_SNAPSHOT" | "RUN_RECIPE" }>,
-): Promise<ContentResponse> {
-  const tab = await getActiveTab();
-  ensureInjectableTab(tab.url);
-  return sendToContent(tab.id, message);
-}
-
-// ── Toast ──────────────────────────────────────────────────────────────────
-
 async function showToast(tabId: number, tabUrl: string, message: string, variant: ToastVariant) {
   try {
     ensureInjectableTab(tabUrl);
     await sendToContent(tabId, { type: "SHOW_TOAST", message, variant });
   } catch {
-    // Toast is best-effort; ignore errors
+    // Toast is best effort. The popup still reports errors when visible.
   }
 }
-
-// ── Storage helpers ────────────────────────────────────────────────────────
 
 async function getProfiles(): Promise<ExtractionProfile[]> {
   const data = await chrome.storage.local.get(PROFILES_KEY);
   const raw = Array.isArray(data[PROFILES_KEY]) ? data[PROFILES_KEY] : [];
   const profiles = raw
-    .map((p) => extractionProfileSchema.safeParse(p))
-    .filter((r) => r.success)
-    .map((r) => r.data);
+    .map((profile) => extractionProfileSchema.safeParse(profile))
+    .filter((result) => result.success)
+    .map((result) => result.data);
   if (JSON.stringify(profiles) !== JSON.stringify(raw)) {
     await chrome.storage.local.set({ [PROFILES_KEY]: profiles });
   }
@@ -99,17 +98,17 @@ async function saveProfile(profile: ExtractionProfile) {
   const parsed = extractionProfileSchema.parse(profile);
   const existing = await getProfiles();
   await chrome.storage.local.set({
-    [PROFILES_KEY]: [parsed, ...existing.filter((p) => p.id !== parsed.id)],
+    [PROFILES_KEY]: [parsed, ...existing.filter((candidate) => candidate.id !== parsed.id)],
   });
   return parsed;
 }
 
 async function updateProfile(profileId: string, updates: Partial<ExtractionProfile>) {
   const profiles = await getProfiles();
-  const idx = profiles.findIndex((p) => p.id === profileId);
-  if (idx === -1) throw new Error("Profile not found.");
-  const merged = extractionProfileSchema.parse({ ...profiles[idx], ...updates, id: profileId });
-  profiles[idx] = merged;
+  const index = profiles.findIndex((profile) => profile.id === profileId);
+  if (index === -1) throw new Error("Profile not found.");
+  const merged = extractionProfileSchema.parse({ ...profiles[index], ...updates, id: profileId });
+  profiles[index] = merged;
   await chrome.storage.local.set({ [PROFILES_KEY]: profiles });
   return merged;
 }
@@ -117,20 +116,19 @@ async function updateProfile(profileId: string, updates: Partial<ExtractionProfi
 async function deleteProfile(profileId: string) {
   const profiles = await getProfiles();
   await chrome.storage.local.set({
-    [PROFILES_KEY]: profiles.filter((p) => p.id !== profileId),
+    [PROFILES_KEY]: profiles.filter((profile) => profile.id !== profileId),
   });
 }
 
 async function updateLastUsed(profile: ExtractionProfile, actionPreset: ActionPreset, urlValue: string) {
-  const url = new URL(urlValue);
   const data = await chrome.storage.local.get(LAST_USED_BY_SITE_KEY);
   const existing =
     data[LAST_USED_BY_SITE_KEY] && typeof data[LAST_USED_BY_SITE_KEY] === "object" && !Array.isArray(data[LAST_USED_BY_SITE_KEY])
       ? data[LAST_USED_BY_SITE_KEY]
       : {};
   const state = lastUsedStateSchema.parse({
-    siteId: url.hostname,
-    configurationId: profile.id,
+    siteId: siteIdForUrl(urlValue),
+    profileId: profile.id,
     urlPattern: createUrlPattern(urlValue),
     lastRunAt: new Date().toISOString(),
     lastActionPreset: actionPreset,
@@ -140,56 +138,13 @@ async function updateLastUsed(profile: ExtractionProfile, actionPreset: ActionPr
   });
 }
 
-async function getLastUsedProfileForSite(urlValue: string): Promise<ExtractionProfile | null> {
-  const url = new URL(urlValue);
+async function getLastUsedProfileForSite(urlValue: string) {
   const data = await chrome.storage.local.get(LAST_USED_BY_SITE_KEY);
   const map = data[LAST_USED_BY_SITE_KEY] ?? {};
-  const state = map[url.hostname] ?? map[url.origin];
-  if (!state?.configurationId) return null;
+  const state = map[siteIdForUrl(urlValue)];
+  if (!state?.profileId) return null;
   const profiles = await getProfiles();
-  return profiles.find((p) => p.id === state.configurationId && matchesUrlPattern(p.urlPattern, urlValue)) ?? null;
-}
-
-// ── Transform execution (relayed through offscreen sandbox for new Function) ─
-
-async function runTransformViaOffscreen(transform: import("@extractor/shared").TransformSpec, data: unknown): Promise<ExportResult> {
-  await ensureOffscreenDocument();
-  const id = crypto.randomUUID();
-  const response = await chrome.runtime.sendMessage({
-    type: OFFSCREEN_TRANSFORM_MESSAGE,
-    id,
-    transform,
-    data,
-  }) as { ok: true; exportResult: ExportResult } | { ok: false; error: string } | undefined;
-
-  if (!response?.ok) {
-    throw new Error(response?.error ?? "Transform failed: no response from offscreen.");
-  }
-  return exportResultSchema.parse(response.exportResult);
-}
-
-// ── Action execution ───────────────────────────────────────────────────────
-
-function fallbackExportResult(data: unknown): ExportResult {
-  return { formatLabel: "JSON", content: JSON.stringify(data, null, 2), warnings: [] };
-}
-
-function extensionForFormat(formatLabel: string) {
-  const lc = formatLabel.toLowerCase();
-  if (lc.includes("markdown")) return "md";
-  if (lc.includes("csv")) return "csv";
-  if (lc.includes("json")) return "json";
-  return "txt";
-}
-
-function sanitizeFilenamePart(value: string) {
-  return value.replace(/[<>:"/\\|?*\x00-\x1f]+/g, "-").replace(/\s+/g, " ").trim();
-}
-
-function createDownloadFilename(profile: ExtractionProfile | undefined, exportResult: ExportResult) {
-  const baseName = sanitizeFilenamePart(profile?.name ?? "webrelay-export") || "webrelay-export";
-  const date = new Date().toISOString().slice(0, 10);
-  return `${baseName}-${date}.${extensionForFormat(exportResult.formatLabel)}`;
+  return profiles.find((profile) => profile.id === state.profileId && matchesUrlPattern(profile.urlPattern, urlValue)) ?? null;
 }
 
 async function ensureOffscreenDocument() {
@@ -203,37 +158,62 @@ async function ensureOffscreenDocument() {
   await chrome.offscreen.createDocument({
     url: "offscreen.html",
     reasons: [chrome.offscreen.Reason.CLIPBOARD, chrome.offscreen.Reason.IFRAME_SCRIPTING],
-    justification: "Write extraction results to the clipboard and run transforms in a sandboxed iframe.",
+    justification: "Copy extraction output and run saved string transforms in a sandbox.",
   });
 }
 
-async function copyExportContent(content: string) {
+async function runScript(code: string, input: string) {
+  const parsed = scriptConfigSchema.parse({ version: 1, code });
   await ensureOffscreenDocument();
-  const response = await chrome.runtime.sendMessage({
-    type: OFFSCREEN_COPY_MESSAGE,
-    content,
-  }) as { ok: true } | { ok: false; error: string } | undefined;
-  if (!response?.ok) {
-    throw new Error(response?.error || "Clipboard write failed.");
+  const response = (await chrome.runtime.sendMessage({
+    type: OFFSCREEN_RUN_SCRIPT_MESSAGE,
+    id: crypto.randomUUID(),
+    code: parsed.code,
+    input,
+  })) as OffscreenResponse | undefined;
+  if (!response) {
+    throw new Error("Script failed.");
   }
+  if (!response.ok) {
+    throw new Error(response.error);
+  }
+  if (!("output" in response)) {
+    throw new Error("Script failed.");
+  }
+  return response.output;
 }
 
-async function downloadExportContent(exportResult: ExportResult, profile?: ExtractionProfile) {
-  const url = `data:text/plain;charset=utf-8,${encodeURIComponent(exportResult.content)}`;
+async function copyContent(content: string) {
+  await ensureOffscreenDocument();
+  const response = (await chrome.runtime.sendMessage({
+    type: OFFSCREEN_COPY_MESSAGE,
+    content,
+  })) as OffscreenResponse | undefined;
+  if (!response?.ok) throw new Error(response?.error || "Clipboard write failed.");
+}
+
+function sanitizeFilenamePart(value: string) {
+  return value.replace(/[<>:"/\\|?*\x00-\x1f]+/g, "-").replace(/\s+/g, " ").trim();
+}
+
+async function downloadContent(content: string, profile: ExtractionProfile) {
+  const baseName = sanitizeFilenamePart(profile.name) || "webrelay-export";
+  const date = new Date().toISOString().slice(0, 10);
+  const url = `data:text/markdown;charset=utf-8,${encodeURIComponent(content)}`;
   await chrome.downloads.download({
     url,
-    filename: createDownloadFilename(profile, exportResult),
+    filename: `${baseName}-${date}.md`,
     saveAs: false,
   });
 }
 
-async function applyAction(exportResult: ExportResult, actionPreset: ActionPreset, profile?: ExtractionProfile): Promise<ActionRunResult> {
+async function applyAction(content: string, actionPreset: ActionPreset, profile: ExtractionProfile): Promise<ActionRunResult> {
   const parsed = actionPresetSchema.parse(actionPreset);
   const result: ActionRunResult = { copied: false, downloaded: false, errors: [] };
 
   if (parsed.type === "copy" || parsed.type === "copy_download") {
     try {
-      await copyExportContent(exportResult.content);
+      await copyContent(content);
       result.copied = true;
     } catch (error) {
       result.errors.push(`Copy failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -242,7 +222,7 @@ async function applyAction(exportResult: ExportResult, actionPreset: ActionPrese
 
   if (parsed.type === "download" || parsed.type === "copy_download") {
     try {
-      await downloadExportContent(exportResult, profile);
+      await downloadContent(content, profile);
       result.downloaded = true;
     } catch (error) {
       result.errors.push(`Download failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -252,61 +232,262 @@ async function applyAction(exportResult: ExportResult, actionPreset: ActionPrese
   return result;
 }
 
-// ── Profile runner ─────────────────────────────────────────────────────────
-
-async function runProfile(profileId: string, actionPresetOverride?: ActionPreset) {
-  const tab = await getActiveTab();
-  const profile = (await getProfiles()).find(
-    (p) => p.id === profileId && matchesUrlPattern(p.urlPattern, tab.url),
-  );
-  if (!profile) throw new Error("No matching saved configuration was found.");
-
-  const contentResponse = await sendToContentByActiveTab({ type: "RUN_RECIPE", recipe: profile.recipe });
+async function runRecipeOnTab(tab: { id: number; url: string }, recipe: unknown) {
+  ensureInjectableTab(tab.url);
+  const contentResponse = await sendToContent(tab.id, {
+    type: "RUN_RECIPE",
+    recipe: extractionRecipeSchema.parse(recipe),
+  });
   if (!contentResponse.ok) throw new Error(contentResponse.error);
-  if (!("result" in contentResponse)) throw new Error("Profile run response was incomplete.");
-
-  const result = contentResponse.result;
-  const exportResult: ExportResult = profile.transform
-    ? await runTransformViaOffscreen(profile.transform, result.data)
-    : fallbackExportResult(result.data);
-
-  const actionPreset = actionPresetOverride ? actionPresetSchema.parse(actionPresetOverride) : profile.actionPreset;
-  const actionResult = await applyAction(exportResult, actionPreset, profile);
-
-  const now = new Date().toISOString();
-  const hostnameUrlPattern = createUrlPattern(tab.url);
-  if (!result.ok || (result.ok && result.debug.rootMatchCount === 0 && result.debug.mode === "list")) {
-    // Auto-mark as possibly failed
-    await updateProfile(profileId, { status: "possibly_failed", urlPattern: hostnameUrlPattern, lastRunAt: now, updatedAt: now });
-  } else {
-    await updateProfile(profileId, { status: "ok", urlPattern: hostnameUrlPattern, actionPreset, lastRunAt: now, updatedAt: now });
-    await updateLastUsed(profile, actionPreset, tab.url);
-  }
-
-  return { result, exportResult, actionResult };
+  if (!("result" in contentResponse)) throw new Error("Recipe response was incomplete.");
+  return { tab, result: contentResponse.result };
 }
 
-// ── Backend proxy ──────────────────────────────────────────────────────────
+async function runRecipeOnActiveTab(recipe: unknown) {
+  return runRecipeOnTab(await getActiveTab(), recipe);
+}
 
-async function postBackend(path: string, body: unknown) {
-  const response = await fetch(`${BACKEND_URL}${path}`, {
+async function createSnapshotOnActiveTab() {
+  const tab = await getActiveTab();
+  ensureInjectableTab(tab.url);
+  const contentResponse = await sendToContent(tab.id, { type: "CREATE_SNAPSHOT" });
+  if (!contentResponse.ok) throw new Error(contentResponse.error);
+  if (!("snapshot" in contentResponse)) throw new Error("Snapshot response was incomplete.");
+  return { snapshot: contentResponse.snapshot, url: contentResponse.url, tabId: tab.id };
+}
+
+function shouldMarkFailed(result: ExtractionResult) {
+  return !result.ok || (result.debug.mode === "list" && result.debug.rootMatchCount === 0);
+}
+
+async function runProfile(profileId: string, actionPresetOverride?: ActionPreset): Promise<ProfileRunResult> {
+  const tab = await getActiveTab();
+  ensureInjectableTab(tab.url);
+  const profiles = await getProfiles();
+  const profile = profiles.find((candidate) => candidate.id === profileId && matchesUrlPattern(candidate.urlPattern, tab.url));
+  if (!profile) throw new Error("No matching saved configuration was found.");
+
+  const { result } = await runRecipeOnActiveTab(profile.recipe);
+  const scriptInput = JSON.stringify(result.data, null, 2);
+  const output = await runScript(profile.script.code, scriptInput);
+  const actionPreset = actionPresetOverride ? actionPresetSchema.parse(actionPresetOverride) : profile.actionPreset;
+  const actionResult = await applyAction(output, actionPreset, profile);
+
+  const now = new Date().toISOString();
+  const updates = shouldMarkFailed(result)
+    ? { status: "possibly_failed" as const, lastRunAt: now, updatedAt: now }
+    : { status: "ok" as const, actionPreset, lastRunAt: now, updatedAt: now };
+  const updatedProfile = await updateProfile(profile.id, updates);
+  if (!shouldMarkFailed(result)) {
+    await updateLastUsed(updatedProfile, actionPreset, tab.url);
+  }
+
+  return { profile: updatedProfile, extraction: result, scriptInput, output, actionResult };
+}
+
+async function runProfilePreview(profile: ExtractionProfile) {
+  const parsed = extractionProfileSchema.parse(profile);
+  const { result } = await runRecipeOnActiveTab(parsed.recipe);
+  const scriptInput = JSON.stringify(result.data, null, 2);
+  const output = await runScript(parsed.script.code, scriptInput);
+  return { extraction: result, scriptInput, output };
+}
+
+async function runProfilePreviewOnTab(profile: ExtractionProfile, tab: { id: number; url: string }) {
+  const parsed = extractionProfileSchema.parse(profile);
+  const { result } = await runRecipeOnTab(tab, parsed.recipe);
+  const scriptInput = JSON.stringify(result.data, null, 2);
+  const output = await runScript(parsed.script.code, scriptInput);
+  return { extraction: result, scriptInput, output };
+}
+
+async function getStudioJob(): Promise<StudioJob | null> {
+  const data = await chrome.storage.local.get(STUDIO_JOB_KEY);
+  const raw = data[STUDIO_JOB_KEY];
+  return raw && typeof raw === "object" ? (raw as StudioJob) : null;
+}
+
+async function setStudioJob(job: StudioJob | null) {
+  if (!job) {
+    await chrome.storage.local.remove(STUDIO_JOB_KEY);
+    return;
+  }
+  await chrome.storage.local.set({ [STUDIO_JOB_KEY]: job });
+}
+
+async function updateStudioJob(jobId: string, update: (job: StudioJob) => StudioJob | null) {
+  const current = await getStudioJob();
+  if (!current || current.id !== jobId) return null;
+  const updated = update(current);
+  if (!updated) return current;
+  await setStudioJob({ ...updated, updatedAt: new Date().toISOString() });
+  return updated;
+}
+
+function appendStudioEvent(job: StudioJob, event: CodexProgressEvent): StudioJob {
+  return { ...job, events: [...job.events, event] };
+}
+
+function buildStudioCandidateProfile(artifact: ExtractionArtifact, baseProfile: ExtractionProfile | undefined, urlValue: string) {
+  const now = new Date().toISOString();
+  return extractionProfileSchema.parse({
+    id: `profile-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    name: "Generated candidate",
+    urlPattern: baseProfile?.urlPattern ?? createUrlPattern(urlValue),
+    recipe: artifact.recipe,
+    script: artifact.script,
+    actionPreset: baseProfile?.actionPreset ?? { type: "copy" },
+    status: "ok",
+    createdAt: now,
+    updatedAt: now,
+    version: 1,
+  });
+}
+
+async function streamBackendArtifact(
+  body: unknown,
+  signal: AbortSignal,
+  onEvent: (event: CodexProgressEvent) => Promise<void>,
+): Promise<GenerateArtifactResult> {
+  const response = await fetch(`${BACKEND_URL}/generate-artifact/stream`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
+    signal,
   });
-  const payload = await response.json();
-  if (!response.ok) {
-    throw new Error(payload.error || `Backend request failed: ${response.status}`);
+  if (!response.ok || !response.body) throw new Error(`Backend stream failed: ${response.status}`);
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let doneResult: GenerateArtifactResult | undefined;
+
+  const consumeChunk = async (chunk: string) => {
+    buffer += chunk;
+    const frames = buffer.split(/\n\n/);
+    buffer = frames.pop() ?? "";
+    for (const frame of frames) {
+      const dataLines = frame
+        .split(/\n/)
+        .filter((line) => line.startsWith("data:"))
+        .map((line) => line.slice(5).trimStart());
+      if (dataLines.length === 0) continue;
+      const event = JSON.parse(dataLines.join("\n")) as CodexProgressEvent;
+      await onEvent(event);
+      if (event.type === "error") throw new Error(event.message);
+      if (event.type === "done") doneResult = event.result as GenerateArtifactResult;
+    }
+  };
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    await consumeChunk(decoder.decode(value, { stream: true }));
   }
-  return payload;
+  await consumeChunk(decoder.decode());
+
+  if (doneResult === undefined) throw new Error("Backend stream ended without a final result.");
+  return doneResult;
 }
 
-// ── Message handler ────────────────────────────────────────────────────────
+async function runStudioJob(job: StudioJob, abortController: AbortController) {
+  try {
+    const result = await streamBackendArtifact(job.request, abortController.signal, async (event) => {
+      await updateStudioJob(job.id, (current) => appendStudioEvent(current, event));
+    });
+    if (abortController.signal.aborted) return;
+
+    const artifact = extractionArtifactSchema.parse(result.artifact);
+    const candidateProfile = buildStudioCandidateProfile(artifact, job.request.baseProfile, job.request.url);
+    await updateStudioJob(job.id, (current) =>
+      appendStudioEvent(
+        {
+          ...current,
+          artifact,
+          outputDescription: artifact.outputDescription,
+          candidateProfile,
+        },
+        { type: "stage", message: "Running generated profile through the shared preview runner" },
+      ),
+    );
+
+    const preview = await runProfilePreviewOnTab(candidateProfile, { id: job.tabId, url: job.tabUrl });
+    await updateStudioJob(job.id, (current) => ({
+      ...appendStudioEvent(appendStudioEvent(current, { type: "artifact", artifactType: "result", label: "Script input", content: preview.scriptInput }), {
+        type: "artifact",
+        artifactType: "result",
+        label: "Preview output",
+        content: preview.output,
+      }),
+      status: "done",
+      artifact,
+      outputDescription: artifact.outputDescription,
+      candidateProfile,
+      preview,
+    }));
+  } catch (error) {
+    const isAbort = abortController.signal.aborted || (error instanceof DOMException && error.name === "AbortError");
+    await updateStudioJob(job.id, (current) => {
+      if (current.status === "cancelled" || isAbort) return current;
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        ...appendStudioEvent(current, { type: "error", message }),
+        status: "error",
+        error: message,
+      };
+    });
+  } finally {
+    if (activeStudioJobId === job.id) {
+      activeStudioAbortController = null;
+      activeStudioJobId = null;
+    }
+  }
+}
+
+async function startStudioGenerate(message: Extract<BackgroundRequest, { type: "START_STUDIO_GENERATE" }>) {
+  const existing = await getStudioJob();
+  if (existing?.status === "running") return existing;
+
+  const now = new Date().toISOString();
+  const job: StudioJob = {
+    id: `studio-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    status: "running",
+    request: message.request,
+    tabId: message.tabId,
+    tabUrl: message.tabUrl,
+    events: [{ type: "stage", message: "Starting Codex Studio generation" }],
+    createdAt: now,
+    updatedAt: now,
+  };
+  await setStudioJob(job);
+
+  const abortController = new AbortController();
+  activeStudioAbortController = abortController;
+  activeStudioJobId = job.id;
+  void runStudioJob(job, abortController);
+  return job;
+}
+
+async function cancelStudioJob() {
+  const job = await getStudioJob();
+  if (!job || job.status !== "running") return job;
+  if (activeStudioJobId === job.id) {
+    activeStudioAbortController?.abort();
+  }
+  const updated = {
+    ...appendStudioEvent(job, { type: "error", message: "Cancelled by user", stage: "cancelled" }),
+    status: "cancelled" as const,
+    error: "Cancelled by user",
+    updatedAt: new Date().toISOString(),
+  };
+  await setStudioJob(updated);
+  return updated;
+}
 
 chrome.runtime.onMessage.addListener(
   (message: BackgroundRequest, _sender, sendResponse: (response: BackgroundResponse) => void) => {
     if ((message as { type?: string }).type === OFFSCREEN_COPY_MESSAGE) return false;
-    if ((message as { type?: string }).type === OFFSCREEN_TRANSFORM_MESSAGE) return false;
+    if ((message as { type?: string }).type === OFFSCREEN_RUN_SCRIPT_MESSAGE) return false;
 
     void (async () => {
       try {
@@ -316,135 +497,18 @@ chrome.runtime.onMessage.addListener(
         }
 
         if (message.type === "CREATE_SNAPSHOT") {
-          const response = await sendToContentByActiveTab({ type: "CREATE_SNAPSHOT" });
-          if (!response.ok) throw new Error(response.error);
-          if (!("snapshot" in response)) throw new Error("Snapshot response incomplete.");
-          sendResponse({ ok: true, snapshot: response.snapshot, url: response.url });
+          sendResponse({ ok: true, ...(await createSnapshotOnActiveTab()) });
           return;
         }
 
         if (message.type === "LIST_PROFILES_FOR_SITE") {
-          const profiles = (await getProfiles()).filter((p) => matchesUrlPattern(p.urlPattern, message.url));
+          const profiles = (await getProfiles()).filter((profile) => matchesUrlPattern(profile.urlPattern, message.url));
           sendResponse({ ok: true, profiles });
           return;
         }
 
         if (message.type === "LIST_ALL_PROFILES") {
           sendResponse({ ok: true, profiles: await getProfiles() });
-          return;
-        }
-
-        if (message.type === "RUN_RECIPE_FOR_PROFILE") {
-          const tab = await getActiveTab();
-          const profile = (await getProfiles()).find(
-            (p) => p.id === message.profileId && matchesUrlPattern(p.urlPattern, tab.url),
-          );
-          if (!profile) throw new Error("No matching saved configuration was found.");
-          const contentResponse = await sendToContentByActiveTab({ type: "RUN_RECIPE", recipe: profile.recipe });
-          if (!contentResponse.ok) throw new Error(contentResponse.error);
-          if (!("result" in contentResponse)) throw new Error("Profile run response was incomplete.");
-          const result = contentResponse.result;
-          const now = new Date().toISOString();
-          const hostnameUrlPattern = createUrlPattern(tab.url);
-          if (!result.ok || (result.ok && result.debug.rootMatchCount === 0 && result.debug.mode === "list")) {
-            await updateProfile(message.profileId, { status: "possibly_failed", urlPattern: hostnameUrlPattern, lastRunAt: now, updatedAt: now });
-          } else {
-            const effectiveActionPreset = message.actionPresetOverride
-              ? actionPresetSchema.parse(message.actionPresetOverride)
-              : profile.actionPreset;
-            await updateProfile(message.profileId, { status: "ok", urlPattern: hostnameUrlPattern, lastRunAt: now, updatedAt: now });
-            await updateLastUsed(profile, effectiveActionPreset, tab.url);
-          }
-          const updatedProfile = (await getProfiles()).find((p) => p.id === message.profileId) ?? profile;
-          sendResponse({ ok: true, result, profile: updatedProfile });
-          return;
-        }
-
-        if (message.type === "DOWNLOAD_EXPORT") {
-          const profile = message.profileId ? (await getProfiles()).find((p) => p.id === message.profileId) : undefined;
-          await downloadExportContent(message.exportResult, profile);
-          sendResponse({ ok: true, downloaded: true });
-          return;
-        }
-
-        if (message.type === "ANALYZE_INTENT") {
-          const payload = await postBackend("/analyze-intent", {
-            domSnapshot: message.domSnapshot,
-            url: message.url,
-          });
-          sendResponse({ ok: true, analysis: payload.analysis as IntentAnalysis });
-          return;
-        }
-
-        if (message.type === "GENERATE_RECIPE") {
-          const payload = await postBackend("/generate-recipe", {
-            url: message.url,
-            intent: message.intent,
-            domSnapshot: message.domSnapshot,
-            confirmedFields: message.confirmedFields,
-            baseRecipe: message.baseRecipe,
-          });
-          const recipe = extractionRecipeSchema.parse(payload.recipe);
-          // Run the recipe immediately for preview
-          const contentResponse = await sendToContentByActiveTab({ type: "RUN_RECIPE", recipe });
-          if (!contentResponse.ok) throw new Error(contentResponse.error);
-          if (!("result" in contentResponse)) throw new Error("Recipe run response incomplete.");
-          sendResponse({ ok: true, recipe, result: contentResponse.result });
-          return;
-        }
-
-        if (message.type === "RUN_RECIPE_PREVIEW") {
-          const recipe = extractionRecipeSchema.parse(message.recipe);
-          const contentResponse = await sendToContentByActiveTab({ type: "RUN_RECIPE", recipe });
-          if (!contentResponse.ok) throw new Error(contentResponse.error);
-          if (!("result" in contentResponse)) throw new Error("Recipe run response incomplete.");
-          sendResponse({ ok: true, recipe, result: contentResponse.result });
-          return;
-        }
-
-        if (message.type === "REFINE_RECIPE") {
-          const payload = await postBackend("/refine", {
-            url: message.url,
-            intent: message.intent,
-            feedback: message.feedback,
-            domSnapshot: message.domSnapshot,
-            currentRecipe: message.currentRecipe,
-            currentResult: message.currentResult,
-          });
-          const artifact = extractionArtifactSchema.parse(payload.artifact);
-          const recipe = artifact.recipe;
-          const transform = artifact.transform ?? null;
-          const tab = await getActiveTab();
-          const contentResponse = await sendToContent(tab.id, { type: "RUN_RECIPE", recipe });
-          if (!contentResponse.ok) throw new Error(contentResponse.error);
-          if (!("result" in contentResponse)) throw new Error("Recipe run response incomplete.");
-          const result = contentResponse.result;
-          const exportResult = transform
-            ? await runTransformViaOffscreen(transform, result.data)
-            : fallbackExportResult(result.data);
-          sendResponse({ ok: true, recipe, result, transform, exportResult });
-          return;
-        }
-
-        if (message.type === "GENERATE_TRANSFORM") {
-          const payload = await postBackend("/transform", {
-            intent: message.intent,
-            outputRequest: message.outputRequest,
-            result: message.result,
-          });
-          sendResponse({
-            ok: true,
-            transform: payload.transform ? transformSpecSchema.parse(payload.transform) : null,
-            exportResult: exportResultSchema.parse(payload.exportResult),
-          });
-          return;
-        }
-
-        if (message.type === "RUN_TRANSFORM_PREVIEW") {
-          const tab = await getActiveTab();
-          const transform = transformSpecSchema.parse(message.transform);
-          const exportResult = await runTransformViaOffscreen(transform, message.data);
-          sendResponse({ ok: true, transform, exportResult });
           return;
         }
 
@@ -464,6 +528,48 @@ chrome.runtime.onMessage.addListener(
           return;
         }
 
+        if (message.type === "RUN_PROFILE") {
+          sendResponse({ ok: true, run: await runProfile(message.profileId, message.actionPresetOverride) });
+          return;
+        }
+
+        if (message.type === "RUN_PROFILE_PREVIEW") {
+          const preview = await runProfilePreview(message.profile);
+          sendResponse({ ok: true, ...preview });
+          return;
+        }
+
+        if (message.type === "RUN_SCRIPT_PREVIEW") {
+          const output = await runScript(message.script.code, message.input);
+          sendResponse({ ok: true, output });
+          return;
+        }
+
+        if (message.type === "START_STUDIO_GENERATE") {
+          sendResponse({ ok: true, job: await startStudioGenerate(message) });
+          return;
+        }
+
+        if (message.type === "GET_STUDIO_JOB") {
+          sendResponse({ ok: true, job: await getStudioJob() });
+          return;
+        }
+
+        if (message.type === "CANCEL_STUDIO_JOB") {
+          sendResponse({ ok: true, job: await cancelStudioJob() });
+          return;
+        }
+
+        if (message.type === "CLEAR_STUDIO_JOB") {
+          const job = await getStudioJob();
+          if (job?.status === "running") {
+            await cancelStudioJob();
+          }
+          await setStudioJob(null);
+          sendResponse({ ok: true, job: null });
+          return;
+        }
+
         sendResponse({ ok: false, error: "Unknown background message." });
       } catch (error) {
         sendResponse({ ok: false, error: error instanceof Error ? error.message : String(error) });
@@ -472,8 +578,6 @@ chrome.runtime.onMessage.addListener(
     return true;
   },
 );
-
-// ── Keyboard shortcut handler ──────────────────────────────────────────────
 
 chrome.commands.onCommand.addListener((command) => {
   if (command !== "run-last-profile") return;
@@ -490,21 +594,20 @@ chrome.commands.onCommand.addListener((command) => {
 
     const profile = await getLastUsedProfileForSite(tab.url);
     if (!profile) {
-      await showToast(tab.id, tab.url, "No saved configuration for this site. Open WebRelay to create one.", "info");
+      await showToast(tab.id, tab.url, "No saved WebRelay profile for this site.", "info");
       return;
     }
 
     try {
       const { actionResult } = await runProfile(profile.id);
-      const errors = actionResult.errors;
-      if (errors.length > 0) {
-        await showToast(tab.id, tab.url, `Run failed: ${errors[0]}`, "error");
-      } else {
-        const parts: string[] = [];
-        if (actionResult.copied) parts.push("Copied to clipboard");
-        if (actionResult.downloaded) parts.push("Downloaded");
-        await showToast(tab.id, tab.url, parts.join(" / ") || "Done", "success");
+      if (actionResult.errors.length > 0) {
+        await showToast(tab.id, tab.url, `Run failed: ${actionResult.errors[0]}`, "error");
+        return;
       }
+      const parts = ([actionResult.copied && "Copied", actionResult.downloaded && "Downloaded"] as (string | false)[])
+        .filter(Boolean)
+        .join(" / ");
+      await showToast(tab.id, tab.url, parts || "Done", "success");
     } catch (error) {
       await showToast(tab.id, tab.url, `Run failed: ${error instanceof Error ? error.message : String(error)}`, "error");
     }

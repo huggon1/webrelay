@@ -23,6 +23,7 @@ const KEEP_ATTRIBUTES = new Set([
   "alt",
   "title",
   "aria-label",
+  "role",
 ]);
 
 function isVisible(element: Element) {

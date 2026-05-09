@@ -9,93 +9,111 @@
   <body>
     <main>
       <header>
-        <h1>WebRelay</h1>
-        <p id="current-url"></p>
+        <div>
+          <h1>WebRelay</h1>
+          <p id="current-url"></p>
+        </div>
+        <button id="btn-new" class="btn-primary">New</button>
       </header>
 
       <nav class="tabs">
-        <button id="tab-codex" class="tab-btn">Codex Studio</button>
         <button id="tab-quickrun" class="tab-btn active">Quick Run</button>
+        <button id="tab-studio" class="tab-btn">Codex Studio</button>
       </nav>
 
-      <!-- Quick Run Panel -->
-      <div id="panel-quickrun" class="tab-panel">
-        <div id="profile-list"></div>
-        <button id="btn-new-config" class="btn-secondary btn-full">+ New config (Codex required)</button>
-      </div>
-
-      <!-- Codex Studio Panel -->
-      <div id="panel-codex" class="tab-panel hidden">
-        <div class="cs-header">
-          <div id="step-indicator" class="step-indicator hidden">
-            <span class="step-dot" data-step="1"><span class="step-label">Extract</span></span>
-            <span class="step-line"></span>
-            <span class="step-dot" data-step="2"><span class="step-label">Review</span></span>
-            <span class="step-line"></span>
-            <span class="step-dot" data-step="3"><span class="step-label">Save</span></span>
+      <section id="panel-quickrun" class="tab-panel">
+        <section id="screen-list" class="screen">
+          <div class="scope-toggle" role="group" aria-label="Profile list scope">
+            <button id="scope-current" class="scope-btn active">Current URL</button>
+            <button id="scope-all" class="scope-btn">All Profiles</button>
           </div>
-          <button id="btn-start-over" class="btn-ghost btn-start-over hidden">Start over</button>
-        </div>
+          <div id="profile-list" class="profile-list"></div>
+        </section>
+      </section>
 
-        <!-- Screen: Entry -->
-        <div id="cs-entry" class="cs-screen">
-          <p class="cs-hint">Describe what to extract, or leave blank to auto-detect.</p>
-          <label class="field-label">
-            Base configuration
-            <select id="cs-base-config"></select>
+      <section id="panel-studio" class="tab-panel hidden">
+        <div id="studio-entry" class="screen">
+          <label>
+            User instructions
+            <textarea id="studio-instructions" rows="4" placeholder="Leave blank for auto mode, or describe what to extract or change."></textarea>
           </label>
-          <label class="field-label">
-            Intent (optional)
-            <textarea id="cs-intent" rows="3" placeholder="e.g. Extract product name, price, and description"></textarea>
+          <label>
+            Base profile
+            <select id="studio-base-profile">
+              <option value="">None - create a new profile</option>
+            </select>
           </label>
-          <button id="btn-extract" class="btn-primary btn-full">Extract &amp; Format</button>
+          <button id="btn-generate" class="btn-primary">Generate</button>
         </div>
 
-        <!-- Screen: Extracting (loading) -->
-        <div id="cs-extracting" class="cs-screen hidden">
-          <div class="process-header">
-            <p id="cs-process-stage" class="process-stage">Preparing...</p>
+        <div id="studio-generating" class="screen hidden">
+          <p id="studio-stage" class="stage">Preparing...</p>
+          <div id="studio-log" class="process-log"></div>
+          <div id="studio-artifacts" class="process-artifacts"></div>
+          <div class="row">
+            <button id="btn-cancel-studio" class="btn-ghost btn-danger">Cancel</button>
+            <button id="btn-clear-studio" class="btn-ghost hidden">Clear</button>
           </div>
-          <div id="cs-process-log" class="process-log" aria-live="polite"></div>
-          <div id="cs-process-artifacts" class="process-artifacts"></div>
+        </div>
+      </section>
+
+      <section id="screen-edit" class="screen hidden">
+        <div class="editor-header">
+          <h2 id="editor-title">New Profile</h2>
+          <button id="btn-back" class="btn-ghost">Back</button>
         </div>
 
-        <!-- Screen: Result (formatted output + feedback) -->
-        <div id="cs-result" class="cs-screen hidden">
-          <div class="result-header">
-            <span id="cs-format-label" class="format-badge">JSON</span>
-          </div>
-          <pre id="cs-result-content" class="result-box"></pre>
-          <label class="field-label">
-            Feedback (optional)
-            <textarea
-              id="cs-result-feedback"
-              rows="2"
-              placeholder="e.g. Use a table, show only top 5, remove currency symbols..."
-            ></textarea>
-          </label>
-          <div class="row-btns">
-            <button id="btn-refine" class="btn-secondary">Refine</button>
-            <button id="btn-result-next" class="btn-primary">Save config</button>
-          </div>
+        <label>
+          Name
+          <input id="profile-name" type="text" placeholder="Chat to Markdown" />
+        </label>
+
+        <label>
+          URL pattern
+          <input id="profile-url-pattern" type="text" />
+        </label>
+
+        <label>
+          Action
+          <select id="profile-action">
+            <option value="copy">Copy</option>
+            <option value="download">Download</option>
+            <option value="copy_download">Copy + Download</option>
+          </select>
+        </label>
+
+        <label>
+          Recipe JSON
+          <textarea id="profile-recipe" class="code-area" spellcheck="false"></textarea>
+        </label>
+
+        <label>
+          JS transform body
+          <textarea id="profile-script" class="code-area" spellcheck="false"></textarea>
+        </label>
+
+        <div class="row">
+          <button id="btn-preview" class="btn-secondary">Run Preview</button>
+          <button id="btn-save" class="btn-primary">Save</button>
         </div>
 
-        <!-- Screen: Save -->
-        <div id="cs-save" class="cs-screen hidden">
-          <label class="field-label">
-            Configuration name
-            <input type="text" id="cs-config-name" placeholder="e.g. Product listing extractor" />
-          </label>
-          <div class="row-btns">
-            <button id="btn-save-back" class="btn-ghost">Back</button>
-            <button id="btn-save-config" class="btn-primary">Save configuration</button>
+        <details id="preview-panel" class="preview-panel">
+          <summary>Preview</summary>
+          <div class="preview-grid">
+            <label>
+              Script input
+              <pre id="preview-input"></pre>
+            </label>
+            <label>
+              Output
+              <pre id="preview-output"></pre>
+            </label>
           </div>
-        </div>
-      </div>
+        </details>
+      </section>
 
       <p id="status-bar" class="status-bar"></p>
     </main>
-    <iframe id="transform-sandbox" src="sandbox.html" style="display:none" sandbox="allow-scripts allow-same-origin"></iframe>
     <script type="module" src="popup.js"></script>
   </body>
 </html>
